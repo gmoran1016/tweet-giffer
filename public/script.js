@@ -11,6 +11,7 @@ const downloadGifBtn = document.getElementById('downloadGifBtn');
 const downloadVideoBtn = document.getElementById('downloadVideoBtn');
 const downloadWebmBtn = document.getElementById('downloadWebmBtn');
 const copyLinkBtn = document.getElementById('copyLinkBtn');
+const shareFormat = document.getElementById('shareFormat');
 const shareSection = document.getElementById('shareSection');
 const tabButtons = document.querySelectorAll('.tab-btn');
 const gifPreview = document.getElementById('gifPreview');
@@ -95,13 +96,19 @@ function displayResults(data) {
   gifImg.src = data.gif;
   videoPlayer.src = data.video;
 
-  // WebM is optional — hide button if server didn't produce one
+  // WebM is optional — hide button and share option if server didn't produce one
   if (data.webm) {
     webmPlayer.src = data.webm;
     downloadWebmBtn.style.display = '';
+    // Show WebM option in share dropdown
+    shareFormat.querySelector('option[value="webm"]').style.display = '';
   } else {
     webmPlayer.src = '';
     downloadWebmBtn.style.display = 'none';
+    // Hide WebM from share dropdown and reset to GIF if it was selected
+    const webmOpt = shareFormat.querySelector('option[value="webm"]');
+    webmOpt.style.display = 'none';
+    if (shareFormat.value === 'webm') shareFormat.value = 'gif';
   }
 
   resultSection.classList.remove('hidden');
@@ -146,29 +153,32 @@ downloadWebmBtn.addEventListener('click', () => {
 
 // Copy share link
 copyLinkBtn.addEventListener('click', async () => {
-  if (currentResult) {
-    const shareUrl = `${window.location.origin}${currentResult.gif}`;
-    
-    try {
-      await navigator.clipboard.writeText(shareUrl);
-      shareSection.classList.remove('hidden');
-      setTimeout(() => {
-        shareSection.classList.add('hidden');
-      }, 3000);
-    } catch (error) {
-      // Fallback for older browsers
-      const textArea = document.createElement('textarea');
-      textArea.value = shareUrl;
-      document.body.appendChild(textArea);
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-      shareSection.classList.remove('hidden');
-      setTimeout(() => {
-        shareSection.classList.add('hidden');
-      }, 3000);
-    }
+  if (!currentResult) return;
+
+  const format = shareFormat.value;
+  const path = format === 'gif'   ? currentResult.gif
+              : format === 'video' ? currentResult.video
+              :                      currentResult.webm;
+
+  if (!path) return;
+
+  const shareUrl = `${window.location.origin}${path}`;
+  const formatLabel = format.toUpperCase();
+
+  try {
+    await navigator.clipboard.writeText(shareUrl);
+  } catch {
+    const textArea = document.createElement('textarea');
+    textArea.value = shareUrl;
+    document.body.appendChild(textArea);
+    textArea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textArea);
   }
+
+  shareSection.querySelector('p').textContent = `${formatLabel} link copied to clipboard!`;
+  shareSection.classList.remove('hidden');
+  setTimeout(() => shareSection.classList.add('hidden'), 3000);
 });
 
 // Show/hide sections

@@ -16,11 +16,14 @@
     <main>
       <div class="input-section">
         <div class="input-group">
-          <input 
-            type="text" 
-            id="tweetUrl" 
-            placeholder="Paste Twitter/X URL here (e.g., https://twitter.com/username/status/123456)" 
+          <input
+            type="url"
+            id="tweetUrl"
+            placeholder="Paste Twitter/X URL here (e.g., https://twitter.com/username/status/123456)"
             autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
           >
           <button id="processBtn" class="btn-primary">Create GIF/Video</button>
         </div>
@@ -55,7 +58,14 @@
           <button id="downloadGifBtn" class="btn-secondary">Download GIF</button>
           <button id="downloadVideoBtn" class="btn-secondary">Download MP4</button>
           <button id="downloadWebmBtn" class="btn-secondary">Download WebM</button>
-          <button id="copyLinkBtn" class="btn-secondary">Copy Share Link</button>
+          <div class="share-group">
+            <select id="shareFormat" class="share-select">
+              <option value="gif">GIF</option>
+              <option value="video">MP4</option>
+              <option value="webm">WebM</option>
+            </select>
+            <button id="copyLinkBtn" class="btn-secondary">Copy Link</button>
+          </div>
         </div>
         <div id="shareSection" class="share-section hidden">
           <p>Share link copied to clipboard!</p>
