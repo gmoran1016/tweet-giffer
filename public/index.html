@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tweet Giffer - Convert Tweets to GIFs/Videos</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🐦 Tweet Giffer</h1>
+      <p class="subtitle">Convert Twitter/X tweets into shareable GIFs and videos</p>
+    </header>
+
+    <main>
+      <div class="input-section">
+        <div class="input-group">
+          <input 
+            type="text" 
+            id="tweetUrl" 
+            placeholder="Paste Twitter/X URL here (e.g., https://twitter.com/username/status/123456)" 
+            autocomplete="off"
+          >
+          <button id="processBtn" class="btn-primary">Create GIF/Video</button>
+        </div>
+      </div>
+
+      <div id="loadingSection" class="loading-section hidden">
+        <div class="spinner"></div>
+        <p>Processing tweet... This may take a moment.</p>
+      </div>
+
+      <div id="resultSection" class="result-section hidden">
+        <h2>Your tweet is ready!</h2>
+        <div class="preview-container">
+          <div class="preview-tabs">
+            <button class="tab-btn active" data-tab="gif">GIF</button>
+            <button class="tab-btn" data-tab="video">Video (MP4)</button>
+            <button class="tab-btn" data-tab="webm">WebM</button>
+          </div>
+          <div class="preview-content">
+            <div id="gifPreview" class="preview active">
+              <img id="gifImg" src="" alt="Tweet GIF">
+            </div>
+            <div id="videoPreview" class="preview">
+              <video id="videoPlayer" controls></video>
+            </div>
+            <div id="webmPreview" class="preview">
+              <video id="webmPlayer" controls></video>
+            </div>
+          </div>
+        </div>
+        <div class="action-buttons">
+          <button id="downloadGifBtn" class="btn-secondary">Download GIF</button>
+          <button id="downloadVideoBtn" class="btn-secondary">Download MP4</button>
+          <button id="downloadWebmBtn" class="btn-secondary">Download WebM</button>
+          <button id="copyLinkBtn" class="btn-secondary">Copy Share Link</button>
+        </div>
+        <div id="shareSection" class="share-section hidden">
+          <p>Share link copied to clipboard!</p>
+        </div>
+      </div>
+
+      <div id="errorSection" class="error-section hidden">
+        <p id="errorMessage"></p>
+      </div>
+    </main>
+
+    <footer>
+      <p>Note: Processing may take 30-60 seconds depending on media content.</p>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

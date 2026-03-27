@@ -1,0 +1,10 @@
+services:
+  tweet-giffer:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist generated outputs between container restarts
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    shm_size: 256mb   # Chromium needs extra shared memory

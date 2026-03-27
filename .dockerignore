@@ -1,0 +1,6 @@
+node_modules
+outputs
+temp
+.git
+*.log
+.env

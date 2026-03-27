@@ -1,0 +1,27 @@
+{
+  "name": "tweet-giffer",
+  "version": "1.0.0",
+  "description": "Convert Twitter/X tweets to shareable GIFs and videos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["twitter", "gif", "video", "tweet"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "puppeteer": "^24.15.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "ffmpeg-static": "^5.2.0",
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0-rc.12",
+    "uuid": "^10.0.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
