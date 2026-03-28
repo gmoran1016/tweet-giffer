@@ -1,6 +1,7 @@
 const tweetUrlInput = document.getElementById('tweetUrl');
 const processBtn = document.getElementById('processBtn');
 const loadingSection = document.getElementById('loadingSection');
+const loadingStatus = document.getElementById('loadingStatus');
 const resultSection = document.getElementById('resultSection');
 const errorSection = document.getElementById('errorSection');
 const errorMessage = document.getElementById('errorMessage');
@@ -41,21 +42,19 @@ tabButtons.forEach(btn => {
 // Process tweet
 processBtn.addEventListener('click', async () => {
   const url = tweetUrlInput.value.trim();
-  
+
   if (!url) {
     showError('Please enter a Twitter/X URL');
     return;
   }
 
-  // Validate URL
   if (!url.includes('twitter.com') && !url.includes('x.com')) {
     showError('Please enter a valid Twitter/X URL');
     return;
   }
 
-  // Hide previous results/errors
   hideAllSections();
-  showLoading();
+  showLoading('Starting...');
 
   try {
     processBtn.disabled = true;
@@ -63,9 +62,7 @@ processBtn.addEventListener('click', async () => {
 
     const response = await fetch('/api/process-tweet', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
 
@@ -75,11 +72,38 @@ processBtn.addEventListener('click', async () => {
       throw new Error(data.error || 'Failed to process tweet');
     }
 
-    // Store result
-    currentResult = data;
+    // Cache hit — result is immediately available
+    if (data.cached) {
+      currentResult = data;
+      displayResults(data);
+      return;
+    }
 
-    // Display results
-    displayResults(data);
+    // Stream progress via SSE until the job completes
+    await new Promise((resolve, reject) => {
+      const es = new EventSource(`/api/progress/${data.jobId}`);
+
+      es.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'step') {
+          updateLoadingMessage(msg.message);
+        } else if (msg.type === 'done') {
+          es.close();
+          currentResult = msg.result;
+          displayResults(msg.result);
+          resolve();
+        } else if (msg.type === 'error') {
+          es.close();
+          reject(new Error(msg.error));
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        reject(new Error('Connection to server lost. Please try again.'));
+      };
+    });
 
   } catch (error) {
     console.error('Error:', error);
@@ -100,12 +124,10 @@ function displayResults(data) {
   if (data.webm) {
     webmPlayer.src = data.webm;
     downloadWebmBtn.style.display = '';
-    // Show WebM option in share dropdown
     shareFormat.querySelector('option[value="webm"]').style.display = '';
   } else {
     webmPlayer.src = '';
     downloadWebmBtn.style.display = 'none';
-    // Hide WebM from share dropdown and reset to GIF if it was selected
     const webmOpt = shareFormat.querySelector('option[value="webm"]');
     webmOpt.style.display = 'none';
     if (shareFormat.value === 'webm') shareFormat.value = 'gif';
@@ -182,8 +204,13 @@ copyLinkBtn.addEventListener('click', async () => {
 });
 
 // Show/hide sections
-function showLoading() {
+function showLoading(message) {
+  loadingStatus.textContent = message || 'Processing tweet... This may take a moment.';
   loadingSection.classList.remove('hidden');
+}
+
+function updateLoadingMessage(message) {
+  loadingStatus.textContent = message;
 }
 
 function hideLoading() {

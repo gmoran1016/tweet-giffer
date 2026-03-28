@@ -48,4 +48,4 @@ RUN mkdir -p outputs temp
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["sh", "-c", "pip3 install -U yt-dlp --break-system-packages --quiet 2>&1 | tail -2 || true && exec node server.js"]

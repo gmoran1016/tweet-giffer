@@ -8,7 +8,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
 const ffmpeg = require('fluent-ffmpeg');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFile } = require('child_process');
 
 let ffmpegPath;
 try {
@@ -41,7 +41,118 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Find the yt-dlp executable (may not be in PATH on Windows)
+// ─── Rate limiting (3 requests/IP/minute) ───────────────────────────────────
+const rateLimitMap = new Map(); // ip -> { count, resetAt }
+const RATE_LIMIT = 3;
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + 60_000 };
+  }
+  entry.count++;
+  rateLimitMap.set(ip, entry);
+  return entry.count <= RATE_LIMIT;
+}
+
+// ─── Tweet ID → videoId cache ────────────────────────────────────────────────
+const tweetCache = new Map(); // tweetId -> videoId
+
+// ─── Job progress tracking (SSE) ────────────────────────────────────────────
+const jobs = new Map(); // jobId -> { steps, result, error, clients }
+
+function createJob(jobId) {
+  jobs.set(jobId, { steps: [], result: null, error: null, clients: [] });
+}
+
+function emitProgress(jobId, data) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  job.steps.push(data);
+  for (const client of job.clients) {
+    try { client.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
+  }
+}
+
+function resolveJob(jobId, result) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  job.result = result;
+  const msg = `data: ${JSON.stringify({ type: 'done', result })}\n\n`;
+  for (const client of job.clients) {
+    try { client.write(msg); client.end(); } catch {}
+  }
+  job.clients = [];
+  setTimeout(() => jobs.delete(jobId), 5 * 60_000);
+}
+
+function rejectJob(jobId, error) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  job.error = error;
+  const msg = `data: ${JSON.stringify({ type: 'error', error })}\n\n`;
+  for (const client of job.clients) {
+    try { client.write(msg); client.end(); } catch {}
+  }
+  job.clients = [];
+  setTimeout(() => jobs.delete(jobId), 5 * 60_000);
+}
+
+// ─── Auto-cleanup of old output files (24h) ─────────────────────────────────
+async function cleanOldOutputs(maxAgeHours = 24) {
+  const cutoff = Date.now() - maxAgeHours * 3_600_000;
+  try {
+    const files = await fs.readdir(outputDir);
+    let removed = 0;
+    for (const file of files) {
+      const filePath = path.join(outputDir, file);
+      const stat = await fs.stat(filePath).catch(() => null);
+      if (stat && stat.mtimeMs < cutoff) {
+        await fs.unlink(filePath).catch(() => {});
+        removed++;
+      }
+    }
+    if (removed) console.log(`Cleanup: removed ${removed} output file(s) older than ${maxAgeHours}h`);
+  } catch (e) {
+    console.warn('Cleanup error:', e.message);
+  }
+}
+
+// ─── Puppeteer browser pool (singleton — warm browser reused across requests) ─
+let _browser = null;
+
+async function getPuppeteerOpts() {
+  const opts = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-web-security',
+      '--allow-file-access-from-files',
+    ],
+  };
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    opts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  return opts;
+}
+
+async function getBrowser() {
+  if (_browser) {
+    try {
+      await _browser.version(); // throws if browser crashed
+      return _browser;
+    } catch {
+      _browser = null;
+    }
+  }
+  _browser = await puppeteer.launch(await getPuppeteerOpts());
+  console.log('Puppeteer browser started');
+  return _browser;
+}
+
+// ─── yt-dlp discovery ────────────────────────────────────────────────────────
 function findYtDlp() {
   // 1. Try yt-dlp directly (if in PATH)
   try {
@@ -49,21 +160,18 @@ function findYtDlp() {
     return 'yt-dlp';
   } catch {}
 
-  // 2. Search common Python Scripts locations
+  // 2. Search common Python Scripts locations (Windows)
   const appData = process.env.APPDATA || '';
   const localAppData = process.env.LOCALAPPDATA || '';
   const candidates = [];
 
-  // User Python installs (pip install --user)
   for (const ver of ['314', '313', '312', '311', '310', '39']) {
     candidates.push(path.join(appData, 'Python', `Python${ver}`, 'Scripts', 'yt-dlp.exe'));
   }
-  // System Python installs
   for (const ver of ['314', '313', '312', '311', '310', '39']) {
     candidates.push(path.join('C:\\Program Files\\Python' + ver, 'Scripts', 'yt-dlp.exe'));
     candidates.push(path.join(localAppData, 'Programs', 'Python', 'Python' + ver, 'Scripts', 'yt-dlp.exe'));
   }
-  // Winget / Scoop / Chocolatey locations
   candidates.push(path.join(localAppData, 'Microsoft', 'WinGet', 'Links', 'yt-dlp.exe'));
   candidates.push('C:\\ProgramData\\chocolatey\\bin\\yt-dlp.exe');
   candidates.push(path.join(process.env.USERPROFILE || '', 'scoop', 'shims', 'yt-dlp.exe'));
@@ -97,6 +205,15 @@ function parseTweetUrl(url) {
   return { username: match[1], tweetId: match[2] };
 }
 
+// Derive tweet date from Twitter snowflake ID
+// Formula: (id >> 22) + Twitter epoch (Nov 4 2010 01:42:54.657 UTC)
+function tweetDateFromId(tweetId) {
+  try {
+    const ms = Number(BigInt(tweetId) >> 22n) + 1288834974657;
+    return new Date(ms);
+  } catch { return null; }
+}
+
 // Fetch tweet metadata via oEmbed (no auth required)
 async function fetchOEmbed(tweetUrl) {
   const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`;
@@ -111,9 +228,7 @@ async function fetchOEmbed(tweetUrl) {
 function extractTweetText(oembedHtml) {
   const $ = cheerio.load(oembedHtml);
   const p = $('blockquote p').first();
-  // Convert <br> to newlines
   p.find('br').replaceWith('\n');
-  // Remove trailing media links (t.co URLs shown as plain URLs)
   p.find('a').each((i, el) => {
     const text = $(el).text().trim();
     if (/^https?:\/\//i.test(text) || text.startsWith('pic.twitter') || text.startsWith('t.co')) {
@@ -151,7 +266,6 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
     proc.stdout.on('data', d => { process.stdout.write(d); });
 
     proc.on('close', async (code) => {
-      // Find the created video file (yt-dlp uses the template ext)
       try {
         const files = await fs.readdir(sessionDir);
         const videoFile = files.find(f => f.startsWith('video.') && /\.(mp4|mkv|webm|mov)$/i.test(f));
@@ -182,7 +296,6 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
 // Get video dimensions, duration, and audio presence using ffmpeg -i
 // (avoids needing ffprobe, which ffmpeg-static does not bundle)
 async function getVideoInfo(videoPath) {
-  const { execFile } = require('child_process');
   const ffmpegBin = ffmpegPath || 'ffmpeg';
 
   return new Promise((resolve) => {
@@ -199,24 +312,22 @@ async function getVideoInfo(videoPath) {
         output.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{3,5})x(\d{3,5})$/m);
       let width  = videoMatch ? parseInt(videoMatch[1], 10) : 1280;
       let height = videoMatch ? parseInt(videoMatch[2], 10) : 720;
-      if (!videoMatch) console.warn('  WARNING: could not detect video dimensions from ffmpeg output — using 1280x720 fallback');
+      if (!videoMatch) console.warn('  WARNING: could not detect video dimensions — using 1280x720 fallback');
 
       // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
-      // Both legacy "rotate: 90" and newer "displaymatrix: rotation of -90.00 degrees" forms.
       let rotation = 0;
       const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/i) ||
                          output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/i);
       if (rotateMeta) {
         const rawDeg = Math.round(parseFloat(rotateMeta[1]));
-        rotation = ((rawDeg % 360) + 360) % 360; // normalize to 0–359
+        rotation = ((rawDeg % 360) + 360) % 360;
         if (rotation === 90 || rotation === 270) {
-          // Swap stored width/height to get true display dimensions
           [width, height] = [height, width];
           console.log(`  Detected rotation ${rotation}° — swapped to display dimensions ${width}x${height}`);
         } else if (rotation === 180) {
           console.log(`  Detected rotation 180°`);
         } else {
-          rotation = 0; // ignore non-orthogonal values
+          rotation = 0;
         }
       }
 
@@ -226,42 +337,9 @@ async function getVideoInfo(videoPath) {
         : 10;
 
       console.log(`  ffmpeg info → ${width}x${height}, ${duration.toFixed(1)}s, audio=${hasAudio}, rotation=${rotation}`);
-      if (!hasAudio && output.includes('Audio:')) {
-        console.warn('  Audio line found but regex did not match — check raw output:');
-        console.warn(output.split('\n').filter(l => l.includes('Audio:')).join('\n'));
-      }
 
       resolve({ width, height, duration, hasAudio, rotation });
     });
-  });
-}
-
-// Pre-rotate video so it is physically oriented correctly (no metadata rotation tag).
-// This is needed so the composite step doesn't have to guess orientation from metadata.
-function fixVideoRotation(videoPath, outputPath, rotation) {
-  return new Promise((resolve, reject) => {
-    let vf;
-    if      (rotation === 90)  vf = 'transpose=1';       // CW 90°
-    else if (rotation === 270) vf = 'transpose=2';        // CCW 90°
-    else if (rotation === 180) vf = 'vflip,hflip';        // 180°
-    else return resolve(videoPath);                        // nothing to do
-
-    let stderrLog = '';
-    ffmpeg(videoPath)
-      .outputOptions([
-        '-vf', vf,
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '18',
-        '-c:a', 'copy',
-        '-metadata:s:v:0', 'rotate=0',  // strip rotation tag so downstream has no auto-rotation
-      ])
-      .output(outputPath)
-      .on('start', cmd => console.log('  fixVideoRotation cmd:', cmd))
-      .on('stderr', line => { stderrLog += line + '\n'; })
-      .on('error', err => reject(new Error(`fixVideoRotation failed: ${err.message}\n${stderrLog.slice(-500)}`)))
-      .on('end', () => resolve(outputPath))
-      .run();
   });
 }
 
@@ -277,12 +355,16 @@ async function downloadFile(url, filePath) {
 }
 
 // Render the tweet as HTML for screenshotting
-function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHtml, cardWidth = 598 }) {
+function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHtml, cardWidth = 598, tweetDate = null }) {
   const esc = s => String(s || '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m]));
 
   const avatarContent = avatarFileUrl
     ? `<img src="${esc(avatarFileUrl)}" class="avatar-img" alt="" />`
     : `<div class="avatar-letter">${esc((authorName || 'T')[0].toUpperCase())}</div>`;
+
+  const dateStr = tweetDate instanceof Date && !isNaN(tweetDate)
+    ? tweetDate.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' })
+    : new Date().toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' });
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -417,7 +499,7 @@ body {
     ${mediaHtml}
   </div>
   <div class="tweet-footer">
-    <span class="tweet-time">${new Date().toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' })}</span>
+    <span class="tweet-time">${dateStr}</span>
     <div class="tweet-actions">
       <span class="action-btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M1.751 10c0-4.42 3.584-8 8.005-8h4.366c4.49 0 7.498 3.159 7.498 6.99 0 3.832-3.008 6.99-7.498 6.99H3.626l-1.875 1.908V10z"/></svg> <span>Reply</span></span>
       <span class="action-btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M4.5 3.88l4.432 4.14-1.364 1.46L5.5 7.55V16c0 1.1.896 2 2 2H13v2H7.5c-2.209 0-4-1.79-4-4V7.55L1.432 9.48.068 8.02 4.5 3.88zM16.5 6H11V4h5.5c2.209 0 4 1.79 4 4v8.45l2.068-1.93 1.364 1.46-4.432 4.14-4.432-4.14 1.364-1.46 2.068 1.93V8c0-1.1-.896-2-2-2z"/></svg> <span>Repost</span></span>
@@ -429,29 +511,15 @@ body {
 </html>`;
 }
 
-// Take a screenshot of the tweet card; return path + video placeholder bounds
+// Take a screenshot of the tweet card using the shared browser pool
 async function screenshotTweet(htmlPath) {
-  const puppeteerOpts = {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-web-security',
-      '--allow-file-access-from-files',
-    ],
-  };
-  // Use system Chromium when running in Docker (set via PUPPETEER_EXECUTABLE_PATH env var)
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    puppeteerOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  const browser = await puppeteer.launch(puppeteerOpts);
+  const browser = await getBrowser();
+  const page = await browser.newPage();
 
   try {
-    const page = await browser.newPage();
     await page.setViewport({ width: 700, height: 1400, deviceScaleFactor: 1 });
     await page.goto(toFileUrl(htmlPath), { waitUntil: 'networkidle0', timeout: 30000 });
 
-    // Wait for images to finish loading
     await page.evaluate(() => Promise.all(
       Array.from(document.images).map(img =>
         img.complete ? null : new Promise(r => { img.onload = r; img.onerror = r; setTimeout(r, 4000); })
@@ -459,12 +527,10 @@ async function screenshotTweet(htmlPath) {
     ));
     await delay(300);
 
-    // Get tweet card bounds
     const cardEl = await page.$('.tweet-card');
     if (!cardEl) throw new Error('Tweet card element not found in rendered HTML');
     const cardBox = await cardEl.boundingBox();
 
-    // Get video placeholder bounds (relative to card top-left)
     let videoArea = null;
     const vpEl = await page.$('.video-placeholder');
     if (vpEl) {
@@ -479,61 +545,59 @@ async function screenshotTweet(htmlPath) {
       }
     }
 
-    // Screenshot just the tweet card
     const screenshotPath = htmlPath.replace('.html', '_frame.png');
     await page.screenshot({
       path: screenshotPath,
-      clip: {
-        x: cardBox.x,
-        y: cardBox.y,
-        width: cardBox.width,
-        height: cardBox.height,
-      },
+      clip: { x: cardBox.x, y: cardBox.y, width: cardBox.width, height: cardBox.height },
     });
 
-    await browser.close();
+    await page.close();
     return { screenshotPath, videoArea, cardWidth: Math.round(cardBox.width) };
   } catch (err) {
-    await browser.close();
+    await page.close().catch(() => {});
     throw err;
   }
 }
 
-// Composite tweet screenshot with video overlay using FFmpeg
-function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false) {
+// Composite tweet screenshot with video overlay using FFmpeg.
+// rotation is handled inline via transpose filter — no pre-encode step needed.
+function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false, rotation = 0) {
   const { x, y } = videoArea;
   // libx264 requires dimensions divisible by 2 — round down
   const width  = videoArea.width  % 2 === 0 ? videoArea.width  : videoArea.width  - 1;
   const height = videoArea.height % 2 === 0 ? videoArea.height : videoArea.height - 1;
 
+  // Apply rotation in the filter chain (avoids a separate pre-encode pass)
+  // These transpose values match FFmpeg's transpose filter: 1=CW90, 2=CCW90
+  let rotateFilter = '';
+  if      (rotation === 90)  rotateFilter = 'transpose=1,';
+  else if (rotation === 270) rotateFilter = 'transpose=2,';
+  else if (rotation === 180) rotateFilter = 'vflip,hflip,';
+
+  const outputOpts = [
+    '-map', '[out]',
+    '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '18',
+    '-movflags', '+faststart',
+  ];
+
+  if (hasAudio) {
+    outputOpts.push('-map', '1:a', '-c:a', 'aac', '-b:a', '192k');
+  }
+
+  let stderrLog = '';
+
   return new Promise((resolve, reject) => {
-    // Build output options — audio mapping only added when the video actually has audio
-    const outputOpts = [
-      '-map', '[out]',
-      '-pix_fmt', 'yuv420p',
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '18',
-      '-movflags', '+faststart',
-    ];
-
-    if (hasAudio) {
-      // Explicit audio stream map — no trailing '?' so FFmpeg errors if audio is missing
-      // (helps us catch mis-detection), then fallback handled in catch below
-      outputOpts.push('-map', '1:a', '-c:a', 'aac', '-b:a', '192k');
-    }
-
-    let stderrLog = '';
-
     const cmd = ffmpeg()
       .input(screenshotPath)
       .inputOptions(['-loop', '1'])
       .input(videoPath)
-      .inputOptions(['-noautorotate'])  // we handle rotation ourselves via fixVideoRotation
+      .inputOptions(['-noautorotate'])  // we apply rotation ourselves via rotateFilter
       .complexFilter([
-        // Scale video to fit within the placeholder box without stretching,
-        // then pad any remaining space with black so dimensions are exact.
-        `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+        // Rotate (if needed), then scale to fit placeholder, pad any remaining space with black
+        `[1:v]${rotateFilter}scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
           `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black[vid]`,
         `[0:v][vid]overlay=${x}:${y}:shortest=1[v1]`,
         // libx264 requires even dimensions — round down via trunc
@@ -548,10 +612,9 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
       .on('progress', p => p.percent && console.log(`  Encoding: ${Math.round(p.percent)}%`))
       .on('error', (err) => {
         console.error('  FFmpeg stderr:\n' + stderrLog.slice(-2000));
-        // If we tried with audio and it failed for any reason, retry without audio
         if (hasAudio) {
           console.warn('  Retrying without audio...');
-          compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false)
+          compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false, rotation)
             .then(resolve).catch(reject);
         } else {
           reject(new Error(`FFmpeg composite failed: ${err.message}\n${stderrLog.slice(-500)}`));
@@ -639,8 +702,38 @@ function videoToWebm(videoPath, webmPath) {
   });
 }
 
-// ─── Main API endpoint ──────────────────────────────────────────────────────
+// ─── SSE progress endpoint ───────────────────────────────────────────────────
+app.get('/api/progress/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
 
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // Replay already-emitted steps (client may connect slightly after job starts)
+  for (const step of job.steps) {
+    res.write(`data: ${JSON.stringify(step)}\n\n`);
+  }
+
+  // Job already finished — send final event and close
+  if (job.result) {
+    res.write(`data: ${JSON.stringify({ type: 'done', result: job.result })}\n\n`);
+    return res.end();
+  }
+  if (job.error) {
+    res.write(`data: ${JSON.stringify({ type: 'error', error: job.error })}\n\n`);
+    return res.end();
+  }
+
+  job.clients.push(res);
+  req.on('close', () => {
+    if (job) job.clients = job.clients.filter(c => c !== res);
+  });
+});
+
+// ─── Main API endpoint ───────────────────────────────────────────────────────
 app.post('/api/process-tweet', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -648,156 +741,187 @@ app.post('/api/process-tweet', async (req, res) => {
   const parsed = parseTweetUrl(url);
   if (!parsed) return res.status(400).json({ error: 'Invalid Twitter/X URL' });
 
+  // Rate limiting
+  const ip = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+  if (!checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
+  }
+
   const { username, tweetId } = parsed;
-  const sessionId = uuidv4();
-  const sessionDir = path.join(tempDir, sessionId);
-  await fs.mkdir(sessionDir, { recursive: true });
 
-  try {
-    console.log(`\n── Processing tweet ${tweetId} by @${username} ──`);
+  // Cache check — return existing output if files are still on disk
+  const cachedVideoId = tweetCache.get(tweetId);
+  if (cachedVideoId) {
+    const mp4 = path.join(outputDir, `${cachedVideoId}.mp4`);
+    const gif = path.join(outputDir, `${cachedVideoId}.gif`);
+    if (fsSync.existsSync(mp4) && fsSync.existsSync(gif)) {
+      console.log(`Cache hit for tweet ${tweetId} → ${cachedVideoId}`);
+      const webmPath = path.join(outputDir, `${cachedVideoId}.webm`);
+      return res.json({
+        success: true,
+        cached: true,
+        video: `/outputs/${cachedVideoId}.mp4`,
+        gif: `/outputs/${cachedVideoId}.gif`,
+        webm: fsSync.existsSync(webmPath) ? `/outputs/${cachedVideoId}.webm` : null,
+        videoId: cachedVideoId,
+      });
+    }
+    tweetCache.delete(tweetId); // stale entry
+  }
 
-    // 1. Fetch tweet metadata via oEmbed
-    console.log('Fetching tweet metadata...');
-    const oembedData = await fetchOEmbed(url);
-    const tweetText = extractTweetText(oembedData.html);
-    const authorName = oembedData.author_name || username;
-    console.log(`  Author: ${authorName}`);
-    console.log(`  Text: ${tweetText.substring(0, 80)}${tweetText.length > 80 ? '…' : ''}`);
+  // Return jobId immediately; process async so the client can stream progress
+  const jobId = uuidv4();
+  createJob(jobId);
+  res.json({ success: true, jobId });
 
-    // 2. Try to download video with yt-dlp
-    let videoPath = null;
-    let videoInfo = null;
+  // ── Async processing ──────────────────────────────────────────────────────
+  (async () => {
+    const sessionId = uuidv4();
+    const sessionDir = path.join(tempDir, sessionId);
+    await fs.mkdir(sessionDir, { recursive: true });
 
     try {
-      console.log('Downloading video with yt-dlp...');
-      videoPath = await downloadVideoYtDlp(url, sessionDir);
-      videoInfo = await getVideoInfo(videoPath);
-      console.log(`  Video: ${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s, audio=${videoInfo.hasAudio}`);
-    } catch (err) {
-      console.warn(`  Video download failed: ${err.message}`);
-      console.warn('  Continuing as image/text-only tweet');
-    }
+      console.log(`\n── Processing tweet ${tweetId} by @${username} (job ${jobId}) ──`);
 
-    // 3. Fetch author avatar
-    let avatarFileUrl = null;
-    try {
-      const avatarPath = path.join(sessionDir, 'avatar.jpg');
-      await downloadFile(`https://unavatar.io/twitter/${username}`, avatarPath);
-      avatarFileUrl = toFileUrl(avatarPath);
-      console.log('  Avatar downloaded');
-    } catch (e) {
-      console.warn(`  Avatar fetch failed: ${e.message}`);
-    }
+      // 1. Fetch tweet metadata
+      emitProgress(jobId, { type: 'step', message: 'Fetching tweet metadata...' });
+      const oembedData = await fetchOEmbed(url);
+      const tweetText = extractTweetText(oembedData.html);
+      const authorName = oembedData.author_name || username;
+      const tweetDate = tweetDateFromId(tweetId);
+      console.log(`  Author: ${authorName}`);
+      console.log(`  Tweet date: ${tweetDate ? tweetDate.toISOString() : 'unknown'}`);
 
-    // 4. Determine card layout and pre-rotate video if needed
-    const isPortrait = !!(videoInfo && videoInfo.height > videoInfo.width);
-    const cardWidth = isPortrait ? 400 : 598;
+      // 2. Download video
+      emitProgress(jobId, { type: 'step', message: 'Downloading video...' });
+      let videoPath = null;
+      let videoInfo = null;
+      try {
+        videoPath = await downloadVideoYtDlp(url, sessionDir);
+        videoInfo = await getVideoInfo(videoPath);
+        console.log(`  Video: ${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s, audio=${videoInfo.hasAudio}`);
+      } catch (err) {
+        console.warn(`  Video download failed: ${err.message}`);
+        emitProgress(jobId, { type: 'step', message: 'No video found, rendering image card...' });
+      }
 
-    if (videoPath && videoInfo && videoInfo.rotation !== 0) {
-      console.log(`  Pre-rotating video ${videoInfo.rotation}°...`);
-      const rotatedPath = path.join(sessionDir, 'video_rotated.mp4');
-      videoPath = await fixVideoRotation(videoPath, rotatedPath, videoInfo.rotation);
-      console.log('  Pre-rotation done');
-    }
+      // 3. Fetch avatar
+      let avatarFileUrl = null;
+      try {
+        const avatarPath = path.join(sessionDir, 'avatar.jpg');
+        await downloadFile(`https://unavatar.io/twitter/${username}`, avatarPath);
+        avatarFileUrl = toFileUrl(avatarPath);
+        console.log('  Avatar downloaded');
+      } catch (e) {
+        console.warn(`  Avatar fetch failed: ${e.message}`);
+      }
 
-    // 5. Build media HTML section
-    let mediaHtml = '';
-    if (videoPath && videoInfo) {
-      // Video tweet: show a placeholder sized to the video's aspect ratio.
-      // Interior width = cardWidth minus 16px padding on each side.
-      const interiorWidth = cardWidth - 32;
-      const aspectRatio = videoInfo.height / videoInfo.width;
-      const placeholderHeight = Math.round(interiorWidth * aspectRatio);
-      mediaHtml = `
+      // 4. Determine card layout
+      // Portrait: use video width + 32px padding, capped at 520px (improvement #9)
+      const isPortrait = !!(videoInfo && videoInfo.height > videoInfo.width);
+      const cardWidth = isPortrait
+        ? Math.min(videoInfo.width + 32, 520)
+        : 598;
+
+      // 5. Build media HTML section
+      let mediaHtml = '';
+      if (videoPath && videoInfo) {
+        const interiorWidth = cardWidth - 32;
+        const aspectRatio = videoInfo.height / videoInfo.width;
+        const placeholderHeight = Math.round(interiorWidth * aspectRatio);
+        mediaHtml = `
     <div class="media-wrap">
       <div class="video-placeholder" style="height:${placeholderHeight}px;">
         <div class="play-icon">&#9654;</div>
       </div>
     </div>`;
-    } else if (oembedData.thumbnail_url) {
-      // Image/GIF tweet: download and embed thumbnail
-      try {
-        const imgPath = path.join(sessionDir, 'media.jpg');
-        await downloadFile(oembedData.thumbnail_url, imgPath);
-        const imgUrl = toFileUrl(imgPath);
-        mediaHtml = `
+      } else if (oembedData.thumbnail_url) {
+        try {
+          const imgPath = path.join(sessionDir, 'media.jpg');
+          await downloadFile(oembedData.thumbnail_url, imgPath);
+          const imgUrl = toFileUrl(imgPath);
+          mediaHtml = `
     <div class="media-wrap">
       <img class="img-single" src="${imgUrl.replace(/['"]/g, '')}" alt="" />
     </div>`;
-        console.log('  Thumbnail downloaded');
-      } catch (e) {
-        console.warn(`  Thumbnail fetch failed: ${e.message}`);
+          console.log('  Thumbnail downloaded');
+        } catch (e) {
+          console.warn(`  Thumbnail fetch failed: ${e.message}`);
+        }
       }
-    }
 
-    // 6. Render tweet HTML and screenshot it
-    const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml, cardWidth });
-    const htmlPath = path.join(sessionDir, 'tweet.html');
-    await fs.writeFile(htmlPath, htmlContent, 'utf8');
+      // 6. Render tweet HTML and screenshot (uses warm browser pool)
+      emitProgress(jobId, { type: 'step', message: 'Rendering tweet card...' });
+      const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml, cardWidth, tweetDate });
+      const htmlPath = path.join(sessionDir, 'tweet.html');
+      await fs.writeFile(htmlPath, htmlContent, 'utf8');
 
-    console.log('Taking tweet screenshot...');
-    const { screenshotPath, videoArea } = await screenshotTweet(htmlPath);
-    console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
+      const { screenshotPath, videoArea } = await screenshotTweet(htmlPath);
+      console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
 
-    // 7. Build output video
-    const videoId = uuidv4();
-    const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
+      // 7. Composite video (rotation applied inline — no pre-encode pass)
+      emitProgress(jobId, { type: 'step', message: 'Compositing video...' });
+      const videoId = uuidv4();
+      const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
 
-    if (videoPath && videoArea) {
-      console.log(`Compositing tweet frame with video (audio=${videoInfo.hasAudio})...`);
-      await compositeVideo(screenshotPath, videoPath, videoArea, outputVideoPath, videoInfo.hasAudio);
-    } else {
-      console.log('Creating static image video (no video in tweet)...');
-      await staticImageToVideo(screenshotPath, outputVideoPath, 5);
-    }
-    console.log('  MP4 created');
+      if (videoPath && videoArea) {
+        console.log(`Compositing tweet frame with video (audio=${videoInfo.hasAudio}, rotation=${videoInfo.rotation})...`);
+        await compositeVideo(screenshotPath, videoPath, videoArea, outputVideoPath, videoInfo.hasAudio, videoInfo.rotation);
+      } else {
+        console.log('Creating static image video (no video in tweet)...');
+        await staticImageToVideo(screenshotPath, outputVideoPath, 5);
+      }
+      console.log('  MP4 created');
 
-    // 8. Convert to GIF
-    const gifPath = path.join(outputDir, `${videoId}.gif`);
-    console.log('Converting to GIF...');
-    try {
-      await videoToGif(outputVideoPath, gifPath, cardWidth);
-      console.log('  GIF created');
-    } catch (gifErr) {
-      console.warn(`  GIF palette conversion failed (${gifErr.message}), trying simple conversion...`);
-      await new Promise((resolve, reject) => {
-        ffmpeg(outputVideoPath)
-          .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
-          .output(gifPath)
-          .on('error', reject)
-          .on('end', resolve)
-          .run();
+      // 8. Convert to GIF
+      emitProgress(jobId, { type: 'step', message: 'Creating GIF...' });
+      const gifPath = path.join(outputDir, `${videoId}.gif`);
+      try {
+        await videoToGif(outputVideoPath, gifPath, cardWidth);
+        console.log('  GIF created');
+      } catch (gifErr) {
+        console.warn(`  GIF palette conversion failed (${gifErr.message}), trying simple conversion...`);
+        await new Promise((resolve, reject) => {
+          ffmpeg(outputVideoPath)
+            .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
+            .output(gifPath)
+            .on('error', reject)
+            .on('end', resolve)
+            .run();
+        });
+        console.log('  GIF created (simple)');
+      }
+
+      // 9. Convert to WebM
+      emitProgress(jobId, { type: 'step', message: 'Creating WebM...' });
+      const webmPath = path.join(outputDir, `${videoId}.webm`);
+      try {
+        await videoToWebm(outputVideoPath, webmPath);
+        console.log('  WebM created');
+      } catch (webmErr) {
+        console.warn(`  WebM conversion failed: ${webmErr.message}`);
+      }
+
+      // Cleanup session temp files
+      await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+
+      // Store in cache
+      tweetCache.set(tweetId, videoId);
+
+      console.log(`\nDone! Output: ${videoId}`);
+      resolveJob(jobId, {
+        video: `/outputs/${videoId}.mp4`,
+        gif: `/outputs/${videoId}.gif`,
+        webm: fsSync.existsSync(webmPath) ? `/outputs/${videoId}.webm` : null,
+        videoId,
       });
-      console.log('  GIF created (simple)');
+
+    } catch (error) {
+      console.error('Error processing tweet:', error);
+      await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+      rejectJob(jobId, error.message || 'Failed to process tweet');
     }
-
-    // 9. Convert to WebM
-    const webmPath = path.join(outputDir, `${videoId}.webm`);
-    console.log('Converting to WebM...');
-    try {
-      await videoToWebm(outputVideoPath, webmPath);
-      console.log('  WebM created');
-    } catch (webmErr) {
-      console.warn(`  WebM conversion failed: ${webmErr.message}`);
-    }
-
-    // 10. Cleanup session temp files
-    await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
-
-    console.log(`\nDone! Output: ${videoId}`);
-    res.json({
-      success: true,
-      video: `/outputs/${videoId}.mp4`,
-      gif: `/outputs/${videoId}.gif`,
-      webm: fsSync.existsSync(webmPath) ? `/outputs/${videoId}.webm` : null,
-      videoId,
-    });
-
-  } catch (error) {
-    console.error('Error processing tweet:', error);
-    await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
-    res.status(500).json({ error: error.message || 'Failed to process tweet' });
-  }
+  })();
 });
 
 // Serve output files
@@ -822,24 +946,17 @@ app.get('/share/:videoId', (req, res) => {
   const gifUrl  = `${base}/outputs/${videoId}.gif`;
   const webmUrl = `${base}/outputs/${videoId}.webm`;
 
-  // Determine the featured file for this share link
   let fileUrl, mimeType;
   if (format === 'webm' && webmExists) {
-    fileUrl  = webmUrl;
-    mimeType = 'video/webm';
+    fileUrl = webmUrl; mimeType = 'video/webm';
   } else if (format === 'gif' && gifExists) {
-    fileUrl  = gifUrl;
-    mimeType = 'image/gif';
+    fileUrl = gifUrl; mimeType = 'image/gif';
   } else if (mp4Exists) {
-    fileUrl  = mp4Url;
-    mimeType = 'video/mp4';
+    fileUrl = mp4Url; mimeType = 'video/mp4';
   } else {
-    fileUrl  = gifUrl;
-    mimeType = 'image/gif';
+    fileUrl = gifUrl; mimeType = 'image/gif';
   }
 
-  // Discord requires og:video to be MP4 for audio to work — always include MP4 tag
-  // even when a different format is featured
   const isVideo = mimeType.startsWith('video/');
   const thumbUrl = gifExists ? gifUrl : mp4Url;
 
@@ -879,6 +996,14 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 async function startServer() {
   await ensureDirectories();
+
+  // Pre-warm browser so first request doesn't pay the launch cost
+  getBrowser().catch(e => console.warn('Browser pre-warm failed:', e.message));
+
+  // Auto-cleanup: remove output files older than 24 hours
+  cleanOldOutputs();
+  setInterval(() => cleanOldOutputs(), 3_600_000);
+
   app.listen(PORT, () => {
     const { version } = require('./package.json');
     console.log(`\nTweet Giffer v${version} running at http://localhost:${PORT}`);
