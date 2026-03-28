@@ -703,7 +703,7 @@ function videoToWebm(videoPath, webmPath) {
   });
 }
 
-// ─── SSE progress endpoint ───────────────────────────────────────────────────
+// ─── SSE progress endpoint (with proxy-busting headers + keepalive heartbeat) ─
 app.get('/api/progress/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
@@ -711,14 +711,14 @@ app.get('/api/progress/:jobId', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');  // disable Nginx proxy buffering
   res.flushHeaders();
 
-  // Replay already-emitted steps (client may connect slightly after job starts)
+  // Replay already-emitted steps
   for (const step of job.steps) {
     res.write(`data: ${JSON.stringify(step)}\n\n`);
   }
 
-  // Job already finished — send final event and close
   if (job.result) {
     res.write(`data: ${JSON.stringify({ type: 'done', result: job.result })}\n\n`);
     return res.end();
@@ -728,9 +728,28 @@ app.get('/api/progress/:jobId', (req, res) => {
     return res.end();
   }
 
+  // Heartbeat every 15s to keep the connection alive through proxies
+  const heartbeat = setInterval(() => {
+    try { res.write(': keepalive\n\n'); } catch { clearInterval(heartbeat); }
+  }, 15_000);
+
   job.clients.push(res);
   req.on('close', () => {
+    clearInterval(heartbeat);
     if (job) job.clients = job.clients.filter(c => c !== res);
+  });
+});
+
+// ─── Polling status endpoint (proxy-safe alternative to SSE) ─────────────────
+// Client polls this every 2s instead of using EventSource when behind a proxy.
+app.get('/api/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({
+    done: !!job.result,
+    error: job.error || null,
+    message: job.steps.length > 0 ? job.steps[job.steps.length - 1].message : 'Starting...',
+    result: job.result || null,
   });
 });
 

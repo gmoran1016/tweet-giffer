@@ -79,30 +79,36 @@ processBtn.addEventListener('click', async () => {
       return;
     }
 
-    // Stream progress via SSE until the job completes
+    // Poll /api/status/:jobId every 2s until the job completes.
+    // Polling is used instead of EventSource (SSE) because reverse proxies
+    // (Nginx, NPM, SWAG) buffer streaming responses and SSE events never arrive.
     await new Promise((resolve, reject) => {
-      const es = new EventSource(`/api/progress/${data.jobId}`);
+      const interval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`/api/status/${data.jobId}`);
+          if (!statusRes.ok) {
+            clearInterval(interval);
+            reject(new Error('Lost connection to server. Please try again.'));
+            return;
+          }
+          const status = await statusRes.json();
 
-      es.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-
-        if (msg.type === 'step') {
-          updateLoadingMessage(msg.message);
-        } else if (msg.type === 'done') {
-          es.close();
-          currentResult = msg.result;
-          displayResults(msg.result);
-          resolve();
-        } else if (msg.type === 'error') {
-          es.close();
-          reject(new Error(msg.error));
+          if (status.error) {
+            clearInterval(interval);
+            reject(new Error(status.error));
+          } else if (status.done) {
+            clearInterval(interval);
+            currentResult = status.result;
+            displayResults(status.result);
+            resolve();
+          } else if (status.message) {
+            updateLoadingMessage(status.message);
+          }
+        } catch (e) {
+          clearInterval(interval);
+          reject(new Error('Lost connection to server. Please try again.'));
         }
-      };
-
-      es.onerror = () => {
-        es.close();
-        reject(new Error('Connection to server lost. Please try again.'));
-      };
+      }, 2000);
     });
 
   } catch (error) {
