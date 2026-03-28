@@ -196,8 +196,8 @@ async function getVideoInfo(videoPath) {
       // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
       // Both legacy "rotate: 90" and newer "displaymatrix: rotation of -90.00 degrees" forms.
       let rotation = 0;
-      const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/) ||
-                         output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/);
+      const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/i) ||
+                         output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/i);
       if (rotateMeta) {
         const rawDeg = Math.round(parseFloat(rotateMeta[1]));
         rotation = ((rawDeg % 360) + 360) % 360; // normalize to 0–359
@@ -246,6 +246,7 @@ function fixVideoRotation(videoPath, outputPath, rotation) {
         '-preset', 'fast',
         '-crf', '18',
         '-c:a', 'copy',
+        '-metadata:s:v:0', 'rotate=0',  // strip rotation tag so downstream has no auto-rotation
       ])
       .output(outputPath)
       .on('start', cmd => console.log('  fixVideoRotation cmd:', cmd))
@@ -526,6 +527,7 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
       .input(screenshotPath)
       .inputOptions(['-loop', '1'])
       .input(videoPath)
+      .inputOptions(['-noautorotate'])  // we handle rotation ourselves via fixVideoRotation
       .complexFilter([
         // Scale video to fit within the placeholder box without stretching,
         // then pad any remaining space with black so dimensions are exact.
