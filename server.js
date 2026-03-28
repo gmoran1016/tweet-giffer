@@ -106,6 +106,7 @@ async function cleanOldOutputs(maxAgeHours = 24) {
     const files = await fs.readdir(outputDir);
     let removed = 0;
     for (const file of files) {
+      if (!/\.(mp4|gif|webm|json)$/i.test(file)) continue;
       const filePath = path.join(outputDir, file);
       const stat = await fs.stat(filePath).catch(() => null);
       if (stat && stat.mtimeMs < cutoff) {
@@ -905,6 +906,10 @@ app.post('/api/process-tweet', async (req, res) => {
       // Cleanup session temp files
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
 
+      // Save metadata so the share page can link back to the original tweet
+      const metaPath = path.join(outputDir, `${videoId}.json`);
+      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: url, authorName }), 'utf8').catch(() => {});
+
       // Store in cache
       tweetCache.set(tweetId, videoId);
 
@@ -929,7 +934,7 @@ app.use('/outputs', express.static(outputDir));
 
 // Share embed page — returns OG-tagged HTML so Discord/Slack/etc embed properly with audio
 // Usage: /share/:videoId?f=video  (f = gif | video | webm, defaults to video)
-app.get('/share/:videoId', (req, res) => {
+app.get('/share/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const format = req.query.f || 'video';
 
@@ -940,6 +945,14 @@ app.get('/share/:videoId', (req, res) => {
   if (!mp4Exists && !gifExists && !webmExists) {
     return res.status(404).send('Not found');
   }
+
+  // Load stored metadata (tweet URL + author) if available
+  let tweetUrl = null;
+  let authorName = null;
+  try {
+    const raw = await fs.readFile(path.join(outputDir, `${videoId}.json`), 'utf8');
+    ({ tweetUrl, authorName } = JSON.parse(raw));
+  } catch {}
 
   const base = `${req.protocol}://${req.get('host')}`;
   const mp4Url  = `${base}/outputs/${videoId}.mp4`;
@@ -959,15 +972,17 @@ app.get('/share/:videoId', (req, res) => {
 
   const isVideo = mimeType.startsWith('video/');
   const thumbUrl = gifExists ? gifUrl : mp4Url;
+  const ogTitle = authorName ? `Tweet by ${authorName}` : 'Tweet Video';
 
   const html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Tweet Video</title>
+  <title>${ogTitle}</title>
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
-  <meta property="og:title" content="Tweet Video" />
+  <meta property="og:title" content="${ogTitle}" />
   <meta property="og:image" content="${thumbUrl}" />
+  ${tweetUrl ? `<meta property="og:url" content="${tweetUrl}" />` : ''}
   ${isVideo ? `
   <meta property="og:video" content="${fileUrl}" />
   <meta property="og:video:url" content="${fileUrl}" />
@@ -985,6 +1000,7 @@ app.get('/share/:videoId', (req, res) => {
 <body>
   <script>window.location.replace('${fileUrl}');</script>
   <p>Redirecting… <a href="${fileUrl}">Click here if not redirected</a></p>
+  ${tweetUrl ? `<p><a href="${tweetUrl}">View original tweet</a></p>` : ''}
 </body>
 </html>`;
 
