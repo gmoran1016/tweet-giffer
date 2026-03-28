@@ -346,13 +346,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.x-logo {
-  font-size: 20px;
-  color: #0f1419;
-  font-weight: 900;
-  flex-shrink: 0;
-  font-family: sans-serif;
-}
+.x-logo { flex-shrink: 0; color: #0f1419; }
 .tweet-body { padding: 4px 16px 12px; }
 .tweet-text {
   font-size: 15px;
@@ -416,7 +410,7 @@ body {
       <div class="author-name">${esc(authorName || 'Twitter User')}</div>
       <div class="author-handle">@${esc(handle || 'user')}</div>
     </div>
-    <div class="x-logo">&#120143;</div>
+    <div class="x-logo"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.748l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></div>
   </div>
   <div class="tweet-body">
     <div class="tweet-text">${esc(tweetText || '')}</div>
@@ -425,9 +419,9 @@ body {
   <div class="tweet-footer">
     <span class="tweet-time">${new Date().toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' })}</span>
     <div class="tweet-actions">
-      <span class="action-btn">💬 <span>Reply</span></span>
-      <span class="action-btn">🔁 <span>Repost</span></span>
-      <span class="action-btn">❤️ <span>Like</span></span>
+      <span class="action-btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M1.751 10c0-4.42 3.584-8 8.005-8h4.366c4.49 0 7.498 3.159 7.498 6.99 0 3.832-3.008 6.99-7.498 6.99H3.626l-1.875 1.908V10z"/></svg> <span>Reply</span></span>
+      <span class="action-btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M4.5 3.88l4.432 4.14-1.364 1.46L5.5 7.55V16c0 1.1.896 2 2 2H13v2H7.5c-2.209 0-4-1.79-4-4V7.55L1.432 9.48.068 8.02 4.5 3.88zM16.5 6H11V4h5.5c2.209 0 4 1.79 4 4v8.45l2.068-1.93 1.364 1.46-4.432 4.14-4.432-4.14 1.364-1.46 2.068 1.93V8c0-1.1-.896-2-2-2z"/></svg> <span>Repost</span></span>
+      <span class="action-btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M16.697 5.5c-1.222-.06-2.679.51-3.89 2.16l-.805 1.09-.806-1.09C9.984 6.01 8.526 5.44 7.304 5.5c-1.243.07-2.349.78-2.91 1.91-.552 1.12-.633 2.78.479 4.82 1.074 1.97 3.257 4.27 7.129 6.61 3.87-2.34 6.052-4.64 7.126-6.61 1.111-2.04 1.03-3.7.477-4.82-.561-1.13-1.666-1.84-2.908-1.91zm4.187 7.69c-1.351 2.48-4.001 5.12-8.379 7.67l-.503.3-.504-.3c-4.379-2.55-7.029-5.19-8.382-7.67-1.36-2.5-1.41-4.86-.514-6.67.887-1.79 2.647-2.91 4.601-3.01 1.651-.09 3.368.56 4.798 2.01 1.429-1.45 3.146-2.1 4.796-2.01 1.954.1 3.714 1.22 4.601 3.01.896 1.81.846 4.17-.514 6.67z"/></svg> <span>Like</span></span>
     </div>
   </div>
 </div>
@@ -519,7 +513,7 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
       '-pix_fmt', 'yuv420p',
       '-c:v', 'libx264',
       '-preset', 'fast',
-      '-crf', '22',
+      '-crf', '18',
       '-movflags', '+faststart',
     ];
 
@@ -580,7 +574,7 @@ function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) {
         '-pix_fmt', 'yuv420p',
         '-c:v', 'libx264',
         '-preset', 'fast',
-        '-crf', '22',
+        '-crf', '18',
         '-movflags', '+faststart',
       ])
       .output(outputPath)
@@ -598,7 +592,7 @@ async function videoToGif(videoPath, gifPath, targetWidth = 598) {
   await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .outputOptions([
-        '-vf', `fps=12,scale=${targetWidth}:-1:flags=lanczos,palettegen=max_colors=256:reserve_transparent=0`,
+        '-vf', `fps=15,scale=${targetWidth}:-1:flags=lanczos,palettegen=max_colors=256:reserve_transparent=0`,
         '-y',
       ])
       .output(palettePath)
@@ -612,7 +606,7 @@ async function videoToGif(videoPath, gifPath, targetWidth = 598) {
     ffmpeg(videoPath)
       .input(palettePath)
       .complexFilter([
-        `[0:v]fps=12,scale=${targetWidth}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer`,
+        `[0:v]fps=15,scale=${targetWidth}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer`,
       ])
       .output(gifPath)
       .on('error', reject)
@@ -630,7 +624,7 @@ function videoToWebm(videoPath, webmPath) {
     ffmpeg(videoPath)
       .outputOptions([
         '-c:v', 'libvpx-vp9',
-        '-crf', '33',
+        '-crf', '28',
         '-b:v', '0',          // CRF-only mode (best quality/size ratio)
         '-c:a', 'libopus',
         '-b:a', '128k',
