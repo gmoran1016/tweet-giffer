@@ -162,7 +162,7 @@ copyLinkBtn.addEventListener('click', async () => {
 
   if (!path) return;
 
-  const shareUrl = `${window.location.origin}${path}`;
+  const shareUrl = `${window.location.origin}/share/${currentResult.videoId}?f=${format}`;
   const formatLabel = format.toUpperCase();
 
   try {

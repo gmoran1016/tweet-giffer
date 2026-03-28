@@ -737,6 +737,78 @@ app.post('/api/process-tweet', async (req, res) => {
 // Serve output files
 app.use('/outputs', express.static(outputDir));
 
+// Share embed page — returns OG-tagged HTML so Discord/Slack/etc embed properly with audio
+// Usage: /share/:videoId?f=video  (f = gif | video | webm, defaults to video)
+app.get('/share/:videoId', (req, res) => {
+  const { videoId } = req.params;
+  const format = req.query.f || 'video';
+
+  const mp4Exists  = fsSync.existsSync(path.join(outputDir, `${videoId}.mp4`));
+  const gifExists  = fsSync.existsSync(path.join(outputDir, `${videoId}.gif`));
+  const webmExists = fsSync.existsSync(path.join(outputDir, `${videoId}.webm`));
+
+  if (!mp4Exists && !gifExists && !webmExists) {
+    return res.status(404).send('Not found');
+  }
+
+  const base = `${req.protocol}://${req.get('host')}`;
+  const mp4Url  = `${base}/outputs/${videoId}.mp4`;
+  const gifUrl  = `${base}/outputs/${videoId}.gif`;
+  const webmUrl = `${base}/outputs/${videoId}.webm`;
+
+  // Determine the featured file for this share link
+  let fileUrl, mimeType;
+  if (format === 'webm' && webmExists) {
+    fileUrl  = webmUrl;
+    mimeType = 'video/webm';
+  } else if (format === 'gif' && gifExists) {
+    fileUrl  = gifUrl;
+    mimeType = 'image/gif';
+  } else if (mp4Exists) {
+    fileUrl  = mp4Url;
+    mimeType = 'video/mp4';
+  } else {
+    fileUrl  = gifUrl;
+    mimeType = 'image/gif';
+  }
+
+  // Discord requires og:video to be MP4 for audio to work — always include MP4 tag
+  // even when a different format is featured
+  const isVideo = mimeType.startsWith('video/');
+  const thumbUrl = gifExists ? gifUrl : mp4Url;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Tweet Video</title>
+  <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
+  <meta property="og:title" content="Tweet Video" />
+  <meta property="og:image" content="${thumbUrl}" />
+  ${isVideo ? `
+  <meta property="og:video" content="${fileUrl}" />
+  <meta property="og:video:url" content="${fileUrl}" />
+  <meta property="og:video:secure_url" content="${fileUrl}" />
+  <meta property="og:video:type" content="${mimeType}" />
+  <meta property="og:video:width" content="598" />
+  ${mp4Exists && mimeType !== 'video/mp4' ? `
+  <meta property="og:video" content="${mp4Url}" />
+  <meta property="og:video:url" content="${mp4Url}" />
+  <meta property="og:video:secure_url" content="${mp4Url}" />
+  <meta property="og:video:type" content="video/mp4" />
+  <meta property="og:video:width" content="598" />` : ''}
+  ` : ''}
+</head>
+<body>
+  <script>window.location.replace('${fileUrl}');</script>
+  <p>Redirecting… <a href="${fileUrl}">Click here if not redirected</a></p>
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 async function startServer() {
