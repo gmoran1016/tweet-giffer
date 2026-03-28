@@ -195,15 +195,20 @@ async function getVideoInfo(videoPath) {
 
       // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
       // Both legacy "rotate: 90" and newer "displaymatrix: rotation of -90.00 degrees" forms.
+      let rotation = 0;
       const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/) ||
                          output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/);
       if (rotateMeta) {
-        const deg = Math.abs(parseFloat(rotateMeta[1]));
-        const normalized = Math.round(deg / 90) * 90 % 180;
-        if (normalized === 90) {
-          // 90° or 270° rotation: swap stored width/height to get display dimensions
+        const rawDeg = Math.round(parseFloat(rotateMeta[1]));
+        rotation = ((rawDeg % 360) + 360) % 360; // normalize to 0–359
+        if (rotation === 90 || rotation === 270) {
+          // Swap stored width/height to get true display dimensions
           [width, height] = [height, width];
-          console.log(`  Detected rotation ${deg}° — swapped to display dimensions ${width}x${height}`);
+          console.log(`  Detected rotation ${rotation}° — swapped to display dimensions ${width}x${height}`);
+        } else if (rotation === 180) {
+          console.log(`  Detected rotation 180°`);
+        } else {
+          rotation = 0; // ignore non-orthogonal values
         }
       }
 
@@ -212,14 +217,42 @@ async function getVideoInfo(videoPath) {
         ? parseInt(durMatch[1], 10) * 3600 + parseInt(durMatch[2], 10) * 60 + parseFloat(durMatch[3])
         : 10;
 
-      console.log(`  ffmpeg info → ${width}x${height}, ${duration.toFixed(1)}s, audio=${hasAudio}`);
+      console.log(`  ffmpeg info → ${width}x${height}, ${duration.toFixed(1)}s, audio=${hasAudio}, rotation=${rotation}`);
       if (!hasAudio && output.includes('Audio:')) {
         console.warn('  Audio line found but regex did not match — check raw output:');
         console.warn(output.split('\n').filter(l => l.includes('Audio:')).join('\n'));
       }
 
-      resolve({ width, height, duration, hasAudio });
+      resolve({ width, height, duration, hasAudio, rotation });
     });
+  });
+}
+
+// Pre-rotate video so it is physically oriented correctly (no metadata rotation tag).
+// This is needed so the composite step doesn't have to guess orientation from metadata.
+function fixVideoRotation(videoPath, outputPath, rotation) {
+  return new Promise((resolve, reject) => {
+    let vf;
+    if      (rotation === 90)  vf = 'transpose=1';       // CW 90°
+    else if (rotation === 270) vf = 'transpose=2';        // CCW 90°
+    else if (rotation === 180) vf = 'vflip,hflip';        // 180°
+    else return resolve(videoPath);                        // nothing to do
+
+    let stderrLog = '';
+    ffmpeg(videoPath)
+      .outputOptions([
+        '-vf', vf,
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '18',
+        '-c:a', 'copy',
+      ])
+      .output(outputPath)
+      .on('start', cmd => console.log('  fixVideoRotation cmd:', cmd))
+      .on('stderr', line => { stderrLog += line + '\n'; })
+      .on('error', err => reject(new Error(`fixVideoRotation failed: ${err.message}\n${stderrLog.slice(-500)}`)))
+      .on('end', () => resolve(outputPath))
+      .run();
   });
 }
 
@@ -235,7 +268,7 @@ async function downloadFile(url, filePath) {
 }
 
 // Render the tweet as HTML for screenshotting
-function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHtml }) {
+function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHtml, cardWidth = 598 }) {
   const esc = s => String(s || '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m]));
 
   const avatarContent = avatarFileUrl
@@ -256,7 +289,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 .tweet-card {
-  width: 598px;
+  width: ${cardWidth}px;
   background: #fff;
   border: 1px solid #cfd9de;
   border-radius: 16px;
@@ -652,12 +685,25 @@ app.post('/api/process-tweet', async (req, res) => {
       console.warn(`  Avatar fetch failed: ${e.message}`);
     }
 
-    // 4. Build media HTML section
+    // 4. Determine card layout and pre-rotate video if needed
+    const isPortrait = !!(videoInfo && videoInfo.height > videoInfo.width);
+    const cardWidth = isPortrait ? 400 : 598;
+
+    if (videoPath && videoInfo && videoInfo.rotation !== 0) {
+      console.log(`  Pre-rotating video ${videoInfo.rotation}°...`);
+      const rotatedPath = path.join(sessionDir, 'video_rotated.mp4');
+      videoPath = await fixVideoRotation(videoPath, rotatedPath, videoInfo.rotation);
+      console.log('  Pre-rotation done');
+    }
+
+    // 5. Build media HTML section
     let mediaHtml = '';
     if (videoPath && videoInfo) {
-      // Video tweet: show a placeholder sized to the video's aspect ratio
+      // Video tweet: show a placeholder sized to the video's aspect ratio.
+      // Interior width = cardWidth minus 16px padding on each side.
+      const interiorWidth = cardWidth - 32;
       const aspectRatio = videoInfo.height / videoInfo.width;
-      const placeholderHeight = Math.round(566 * aspectRatio); // 566 = card width minus padding
+      const placeholderHeight = Math.round(interiorWidth * aspectRatio);
       mediaHtml = `
     <div class="media-wrap">
       <div class="video-placeholder" style="height:${placeholderHeight}px;">
@@ -680,8 +726,8 @@ app.post('/api/process-tweet', async (req, res) => {
       }
     }
 
-    // 5. Render tweet HTML and screenshot it
-    const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml });
+    // 6. Render tweet HTML and screenshot it
+    const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml, cardWidth });
     const htmlPath = path.join(sessionDir, 'tweet.html');
     await fs.writeFile(htmlPath, htmlContent, 'utf8');
 
@@ -689,7 +735,7 @@ app.post('/api/process-tweet', async (req, res) => {
     const { screenshotPath, videoArea } = await screenshotTweet(htmlPath);
     console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
 
-    // 6. Build output video
+    // 7. Build output video
     const videoId = uuidv4();
     const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
 
@@ -702,17 +748,17 @@ app.post('/api/process-tweet', async (req, res) => {
     }
     console.log('  MP4 created');
 
-    // 7. Convert to GIF
+    // 8. Convert to GIF
     const gifPath = path.join(outputDir, `${videoId}.gif`);
     console.log('Converting to GIF...');
     try {
-      await videoToGif(outputVideoPath, gifPath);
+      await videoToGif(outputVideoPath, gifPath, cardWidth);
       console.log('  GIF created');
     } catch (gifErr) {
       console.warn(`  GIF palette conversion failed (${gifErr.message}), trying simple conversion...`);
       await new Promise((resolve, reject) => {
         ffmpeg(outputVideoPath)
-          .outputOptions(['-vf', 'fps=12,scale=598:-1:flags=lanczos'])
+          .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
           .output(gifPath)
           .on('error', reject)
           .on('end', resolve)
@@ -721,7 +767,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.log('  GIF created (simple)');
     }
 
-    // 8. Convert to WebM
+    // 9. Convert to WebM
     const webmPath = path.join(outputDir, `${videoId}.webm`);
     console.log('Converting to WebM...');
     try {
@@ -731,7 +777,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.warn(`  WebM conversion failed: ${webmErr.message}`);
     }
 
-    // 9. Cleanup session temp files
+    // 10. Cleanup session temp files
     await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
 
     console.log(`\nDone! Output: ${videoId}`);
