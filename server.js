@@ -135,10 +135,10 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
       '-o', outputTemplate,
       '--no-playlist',
       '--merge-output-format', 'mp4',
-      // Prefer native portrait formats (height>width) so we get the real vertical video
-      // rather than Twitter's letterboxed landscape re-encode with baked-in black bars.
-      // Falls back to best landscape if no portrait format exists (normal landscape tweets).
-      '-f', 'bestvideo[height>width][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>width]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      // Use combined (muxed) formats first — these are always natively oriented.
+      // Avoid bestvideo+bestaudio which on Docker picks HLS video-only streams that
+      // Twitter encodes as landscape with black bars baked in.
+      '-f', 'best[ext=mp4]/best',
       '--no-warnings',
       '--quiet',
     ];
@@ -192,9 +192,14 @@ async function getVideoInfo(videoPath) {
 
       const hasAudio = /Stream #\S+: Audio:/i.test(output);
 
-      const videoMatch = output.match(/Stream #\S+: Video:[^,\n]*,\s*(\d{2,5})x(\d{2,5})/);
+      // Match WxH in the Video stream line. Dimensions are 3-5 digits each, preceded by
+      // space/comma and followed by space/comma/bracket (or end of line).
+      const videoMatch =
+        output.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{3,5})x(\d{3,5})[ ,\[]/) ||
+        output.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{3,5})x(\d{3,5})$/m);
       let width  = videoMatch ? parseInt(videoMatch[1], 10) : 1280;
       let height = videoMatch ? parseInt(videoMatch[2], 10) : 720;
+      if (!videoMatch) console.warn('  WARNING: could not detect video dimensions from ffmpeg output — using 1280x720 fallback');
 
       // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
       // Both legacy "rotate: 90" and newer "displaymatrix: rotation of -90.00 degrees" forms.
