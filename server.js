@@ -135,7 +135,10 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
       '-o', outputTemplate,
       '--no-playlist',
       '--merge-output-format', 'mp4',
-      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      // Prefer native portrait formats (height>width) so we get the real vertical video
+      // rather than Twitter's letterboxed landscape re-encode with baked-in black bars.
+      // Falls back to best landscape if no portrait format exists (normal landscape tweets).
+      '-f', 'bestvideo[height>width][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>width]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
       '--no-warnings',
       '--quiet',
     ];
