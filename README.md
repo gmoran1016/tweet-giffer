@@ -1,76 +1,102 @@
 # Tweet Giffer
 
-A web application that converts Twitter/X tweets into downloadable and shareable GIFs or videos, including all media content (images, videos, GIFs) and audio.
+Convert Twitter/X tweet videos into shareable GIFs, MP4s, and WebMs — styled to look exactly like a tweet card, with audio.
+
+Paste a tweet URL and get back a rendered tweet card with the video composited in, ready to download or share. Share links include Open Graph metadata so they embed properly in Discord with audio.
+
+---
 
 ## Features
 
-- Input a Twitter/X URL to process
-- Automatically fetches tweet data including media
-- Renders the tweet as it appears on Twitter
-- Includes all images, videos, GIFs, and audio
-- Generates downloadable GIF or video file
-- Shareable links for Discord and other platforms
+- **Three output formats** — GIF, MP4 (with audio), and WebM (VP9/Opus)
+- **Tweet card rendering** — screenshot of the tweet including avatar, author, and text
+- **Portrait & landscape video** — auto-detects orientation; portrait videos get a phone-style narrow card
+- **Audio preserved** — downloaded via yt-dlp, composited with FFmpeg
+- **Discord embeds** — share links serve OG meta tags so Discord previews play the video with sound
+- **Self-hostable** — Docker image published to GitHub Container Registry on every push
 
-## Setup
+---
 
-### Prerequisites
+## Docker (recommended)
 
-- Node.js 16 or higher
-- FFmpeg installed on your system
-- Internet connection
-
-### Installation Steps
-
-1. **Install Node.js dependencies:**
 ```bash
+docker run -d \
+  --name tweet-giffer \
+  -p 3000:3000 \
+  -v ./outputs:/app/outputs \
+  --shm-size=256m \
+  ghcr.io/gmoran1016/tweet-giffer:latest
+```
+
+Or with Docker Compose:
+
+```yaml
+services:
+  tweet-giffer:
+    image: ghcr.io/gmoran1016/tweet-giffer:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./outputs:/app/outputs
+    shm_size: 256mb
+    restart: unless-stopped
+```
+
+The image includes Chromium, FFmpeg, and yt-dlp — no separate installs needed.
+
+---
+
+## Local Development
+
+**Prerequisites:** Node.js 18+, [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+
+```bash
+# Install yt-dlp
+pip install yt-dlp
+
+# Install dependencies
 npm install
-```
 
-2. **Install FFmpeg:**
-   
-   **Windows:**
-   - Download FFmpeg from https://www.gyan.dev/ffmpeg/builds/ or https://ffmpeg.org/download.html
-   - Extract the zip file to a location like `C:\ffmpeg`
-   - Add `C:\ffmpeg\bin` to your system PATH:
-     - Open System Properties → Environment Variables
-     - Under System Variables, find "Path" and click Edit
-     - Click New and add `C:\ffmpeg\bin` (or your installation path)
-     - Click OK to save
-   - Verify installation by running `ffmpeg -version` in a new terminal
-   
-   **macOS:**
-   ```bash
-   brew install ffmpeg
-   ```
-   
-   **Linux (Ubuntu/Debian):**
-   ```bash
-   sudo apt-get update
-   sudo apt-get install ffmpeg
-   ```
+# Install Puppeteer's Chrome
+npx puppeteer browsers install chrome
 
-3. **Start the server:**
-```bash
-npm start
-```
-
-   Or for development with auto-reload:
-```bash
+# Start (with auto-reload)
 npm run dev
 ```
 
-4. **Open your browser:**
-   Navigate to `http://localhost:3000`
+Open `http://localhost:3000`.
+
+---
 
 ## Usage
 
-1. Enter a Twitter/X URL in the input field
-2. Click "Create GIF/Video"
-3. Wait for processing to complete
-4. Download or share the generated file
+1. Paste a `twitter.com` or `x.com` tweet URL
+2. Click **Create GIF/Video** and wait ~30–60 seconds
+3. Switch between GIF / MP4 / WebM tabs to preview
+4. Download the format you want, or use **Copy Link** to get a shareable URL
 
-## Requirements
+Share links (`/share/:id?f=video`) serve an HTML page with Open Graph video tags, so Discord and other platforms embed the video with sound.
 
-- Node.js 16+ 
-- FFmpeg installed on your system
-- Internet connection for fetching tweets
+---
+
+## How It Works
+
+```
+Tweet URL
+  → yt-dlp downloads the video
+  → Twitter oEmbed API fetches author + tweet text
+  → Puppeteer renders a tweet card HTML → screenshot
+  → FFmpeg composites the screenshot + video
+  → 2-pass palette GIF + MP4 + WebM outputs
+```
+
+Key dependencies: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Puppeteer](https://pptr.dev/), [fluent-ffmpeg](https://github.com/fluent-ffmpeg/node-fluent-ffmpeg), [ffmpeg-static](https://github.com/eugeneware/ffmpeg-static)
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | Port the server listens on |
+| `PUPPETEER_EXECUTABLE_PATH` | *(bundled)* | Path to Chromium binary (set automatically in Docker) |
