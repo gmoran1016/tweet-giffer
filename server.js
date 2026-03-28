@@ -830,7 +830,8 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 async function startServer() {
   await ensureDirectories();
   app.listen(PORT, () => {
-    console.log(`\nTweet Giffer running at http://localhost:${PORT}`);
+    const { version } = require('./package.json');
+    console.log(`\nTweet Giffer v${version} running at http://localhost:${PORT}`);
     console.log('Requires: yt-dlp installed and in PATH (https://github.com/yt-dlp/yt-dlp)\n');
   });
 }
