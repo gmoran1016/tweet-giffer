@@ -190,8 +190,22 @@ async function getVideoInfo(videoPath) {
       const hasAudio = /Stream #\S+: Audio:/i.test(output);
 
       const videoMatch = output.match(/Stream #\S+: Video:[^,\n]*,\s*(\d{2,5})x(\d{2,5})/);
-      const width  = videoMatch ? parseInt(videoMatch[1], 10) : 1280;
-      const height = videoMatch ? parseInt(videoMatch[2], 10) : 720;
+      let width  = videoMatch ? parseInt(videoMatch[1], 10) : 1280;
+      let height = videoMatch ? parseInt(videoMatch[2], 10) : 720;
+
+      // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
+      // Both legacy "rotate: 90" and newer "displaymatrix: rotation of -90.00 degrees" forms.
+      const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/) ||
+                         output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/);
+      if (rotateMeta) {
+        const deg = Math.abs(parseFloat(rotateMeta[1]));
+        const normalized = Math.round(deg / 90) * 90 % 180;
+        if (normalized === 90) {
+          // 90° or 270° rotation: swap stored width/height to get display dimensions
+          [width, height] = [height, width];
+          console.log(`  Detected rotation ${deg}° — swapped to display dimensions ${width}x${height}`);
+        }
+      }
 
       const durMatch = output.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
       const duration = durMatch
@@ -200,7 +214,6 @@ async function getVideoInfo(videoPath) {
 
       console.log(`  ffmpeg info → ${width}x${height}, ${duration.toFixed(1)}s, audio=${hasAudio}`);
       if (!hasAudio && output.includes('Audio:')) {
-        // Safety check: log raw output so we can debug unexpected non-matches
         console.warn('  Audio line found but regex did not match — check raw output:');
         console.warn(output.split('\n').filter(l => l.includes('Audio:')).join('\n'));
       }
@@ -481,7 +494,10 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
       .inputOptions(['-loop', '1'])
       .input(videoPath)
       .complexFilter([
-        `[1:v]scale=${width}:${height}[vid]`,
+        // Scale video to fit within the placeholder box without stretching,
+        // then pad any remaining space with black so dimensions are exact.
+        `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+          `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black[vid]`,
         `[0:v][vid]overlay=${x}:${y}:shortest=1[v1]`,
         // libx264 requires even dimensions — round down via trunc
         `[v1]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]`,
