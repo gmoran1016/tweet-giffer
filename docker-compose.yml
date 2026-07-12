@@ -1,10 +1,24 @@
 services:
   tweet-giffer:
     build: .
+    init: true
     ports:
       - "3000:3000"
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-2}
     volumes:
       # Persist generated outputs between container restarts
       - ./outputs:/app/outputs
+    tmpfs:
+      - /app/temp:mode=1770,uid=1000,gid=1000
     restart: unless-stopped
     shm_size: 256mb   # Chromium needs extra shared memory
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

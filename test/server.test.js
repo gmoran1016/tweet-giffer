@@ -15,6 +15,7 @@ test.before(async () => {
   process.env.TEMP_DIR = path.join(root, 'temp');
   process.env.MAX_CONCURRENT_JOBS = '1';
   process.env.RATE_LIMIT = '100';
+  process.env.ALLOWED_ORIGIN = 'https://app.example.test';
   const api = require('../server');
   server = await api.startServer({ port: 0, prewarm: false });
   base = `http://127.0.0.1:${server.address().port}`;
@@ -51,6 +52,13 @@ test('rejects malformed tweet URLs', async () => {
     body: JSON.stringify({ url: 'https://evil.example/alice/status/123' }),
   });
   assert.equal(response.status, 400);
+});
+
+test('allows the configured canonical CORS origin', async () => {
+  const response = await fetch(`${base}/api/health`, {
+    headers: { origin: 'https://app.example.test' },
+  });
+  assert.equal(response.headers.get('access-control-allow-origin'), 'https://app.example.test');
 });
 
 test('rejects invalid job and output IDs before lookup', async () => {

@@ -23,7 +23,8 @@ const PORT = process.env.PORT || 3000;
 
 app.disable('x-powered-by');
 app.set('trust proxy', /^(1|true)$/i.test(process.env.TRUST_PROXY || ''));
-if (process.env.CORS_ORIGIN) app.use(cors({ origin: process.env.CORS_ORIGIN }));
+const allowedOrigin = process.env.ALLOWED_ORIGIN || process.env.CORS_ORIGIN;
+if (allowedOrigin) app.use(cors({ origin: allowedOrigin }));
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');

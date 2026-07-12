@@ -18,6 +18,16 @@ test('parseTweetUrl accepts exact HTTPS Twitter and X hosts', () => {
   }
 });
 
+test('parseTweetUrl accepts username boundary lengths', () => {
+  for (const username of ['a', 'abcdefghijklmno']) {
+    assert.equal(parseTweetUrl(`https://x.com/${username}/status/123`)?.username, username);
+  }
+});
+
+test('parseTweetUrl rejects usernames longer than 15 characters', () => {
+  assert.equal(parseTweetUrl('https://x.com/abcdefghijklmnop/status/123'), null);
+});
+
 test('parseTweetUrl rejects unsafe or malformed tweet URLs', () => {
   const invalid = [
     'http://x.com/OpenAI/status/123',
