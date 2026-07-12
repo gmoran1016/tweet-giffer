@@ -24,3 +24,12 @@
 ## Concerns
 
 - No browser validation was performed in this task, as explicitly requested. Desktop/mobile rendering, clipboard fallback behavior, and screen-reader announcements should be confirmed in the parent browser smoke check.
+
+## Review follow-up
+
+- Replaced shared polling state with per-run controller, deadline, and polling timer ownership. Every asynchronous status update, result, error, and final UI reset is guarded by the active run identity, so an aborted stale run cannot alter a newer run.
+- Added strict result validation before assigning media sources or enabling downloads: `videoId` must be a UUID v4, and GIF/MP4/optional WebM URLs must resolve to the current origin at `/outputs/<same-id>.<expected-extension>` without query strings or fragments.
+- Made the skip-link destination programmatically focusable by targeting `mainContent` with `tabindex="-1"`.
+- Made clipboard fallback check `execCommand('copy')`, catch fallback errors, and announce a failure message instead of claiming success.
+- Review regression checks followed a red/green cycle: 4 expected failures before the fixes, then 4 passes. The temporary focused test was removed after verification.
+- Fresh follow-up verification: `npm run check` and `git diff --check` passed. Browser smoke remains deferred to the parent agent.

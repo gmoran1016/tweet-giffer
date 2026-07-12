@@ -22,9 +22,9 @@ const webmOption = shareFormat.querySelector('option[value="webm"]');
 const ALLOWED_HOSTNAMES = new Set(['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com']);
 const POLL_INTERVAL_MS = 2000;
 const POLL_DEADLINE_MS = 5 * 60 * 1000;
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let currentResult = null;
-let activeController = null;
-let pollTimer = null;
+let activeRun = null;
 let shareTimer = null;
 
 function selectTab(tab, focus = false) {
@@ -76,26 +76,27 @@ async function readJsonResponse(response, fallbackMessage) {
   return data;
 }
 
-function waitForNextPoll(signal) {
+function waitForNextPoll(run) {
   return new Promise((resolve, reject) => {
-    const onAbort = () => { clearTimeout(pollTimer); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
+    const { signal } = run.controller;
+    const onAbort = () => { clearTimeout(run.pollTimer); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
     signal.addEventListener('abort', onAbort, { once: true });
-    pollTimer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, POLL_INTERVAL_MS);
+    run.pollTimer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, POLL_INTERVAL_MS);
   });
 }
 
-async function pollForResult(jobId, signal, deadline) {
+async function pollForResult(jobId, run) {
   if (!jobId || typeof jobId !== 'string') throw new Error('Server returned an invalid job response.');
-  while (Date.now() < deadline) {
-    await waitForNextPoll(signal);
-    const response = await fetch(`/api/status/${encodeURIComponent(jobId)}`, { signal, headers: { Accept: 'application/json' } });
+  while (Date.now() < run.deadline) {
+    await waitForNextPoll(run);
+    const response = await fetch(`/api/status/${encodeURIComponent(jobId)}`, { signal: run.controller.signal, headers: { Accept: 'application/json' } });
     const status = await readJsonResponse(response, 'Lost connection to server. Please try again.');
     if (typeof status.error === 'string') throw new Error(status.error);
     if (status.done) {
       if (!status.result || typeof status.result !== 'object') throw new Error('Server returned an invalid result.');
       return status.result;
     }
-    if (typeof status.message === 'string') loadingStatus.textContent = status.message;
+    if (typeof status.message === 'string' && activeRun === run) loadingStatus.textContent = status.message;
   }
   throw new Error('Processing timed out after five minutes. Please try again.');
 }
@@ -105,15 +106,18 @@ function clearMedia() {
   [videoPlayer, webmPlayer].forEach((player) => { player.pause(); player.removeAttribute('src'); player.load(); });
 }
 
-function cleanupRun() {
-  clearTimeout(pollTimer); pollTimer = null;
-  if (activeController) activeController.abort();
-  activeController = null;
+function cleanupRun(run, abort = true) {
+  if (!run) return;
+  clearTimeout(run.pollTimer);
+  clearTimeout(run.deadlineTimer);
+  run.pollTimer = null;
+  if (abort && !run.controller.signal.aborted) run.controller.abort();
+  if (activeRun === run) activeRun = null;
 }
 
 tweetForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  cleanupRun();
+  cleanupRun(activeRun);
   clearTimeout(shareTimer);
   clearMedia();
   currentResult = null;
@@ -123,10 +127,9 @@ tweetForm.addEventListener('submit', async (event) => {
   try { url = parseTweetUrl(tweetUrlInput.value.trim()); }
   catch (error) { showError(error.message); tweetUrlInput.focus(); return; }
 
-  activeController = new AbortController();
-  const controller = activeController;
-  const deadline = Date.now() + POLL_DEADLINE_MS;
-  const deadlineTimer = setTimeout(() => controller.abort(new DOMException('Processing timed out after five minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
+  const run = { controller: new AbortController(), deadline: Date.now() + POLL_DEADLINE_MS, deadlineTimer: null, pollTimer: null };
+  activeRun = run;
+  run.deadlineTimer = setTimeout(() => run.controller.abort(new DOMException('Processing timed out after five minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
   showLoading('Starting...');
   processBtn.disabled = true;
   processBtn.textContent = 'Processing...';
@@ -134,26 +137,51 @@ tweetForm.addEventListener('submit', async (event) => {
   try {
     const response = await fetch('/api/process-tweet', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ url }), signal: controller.signal,
+      body: JSON.stringify({ url }), signal: run.controller.signal,
     });
     const data = await readJsonResponse(response, 'Failed to process tweet. Please try again.');
-    const result = data.cached ? data : await pollForResult(data.jobId, controller.signal, deadline);
-    displayResults(result);
+    const result = validateResultPayload(data.cached ? data : await pollForResult(data.jobId, run));
+    if (activeRun === run) displayResults(result);
   } catch (error) {
-    const message = error.name === 'TimeoutError' ? error.message :
-      error.name === 'AbortError' ? 'Processing was cancelled. Please try again.' : error.message;
-    showError(message || 'Failed to process tweet. Please try again.');
+    if (activeRun === run) {
+      const message = error.name === 'TimeoutError' ? error.message :
+        error.name === 'AbortError' ? 'Processing was cancelled. Please try again.' : error.message;
+      showError(message || 'Failed to process tweet. Please try again.');
+    }
   } finally {
-    clearTimeout(deadlineTimer); clearTimeout(pollTimer);
-    if (activeController === controller) activeController = null;
-    processBtn.disabled = false; processBtn.textContent = 'Create GIF/Video'; hideLoading();
+    clearTimeout(run.deadlineTimer); clearTimeout(run.pollTimer);
+    if (activeRun === run) {
+      activeRun = null;
+      processBtn.disabled = false; processBtn.textContent = 'Create GIF/Video'; hideLoading();
+    }
   }
 });
 
-function displayResults(data) {
-  if (!data || typeof data.gif !== 'string' || typeof data.video !== 'string' || typeof data.videoId !== 'string') {
+function validateOutputPath(value, videoId, extension, optional = false) {
+  if (optional && (value === null || value === undefined || value === '')) return null;
+  if (typeof value !== 'string') throw new Error('Server returned an invalid result.');
+  let candidate;
+  try { candidate = new URL(value, window.location.origin); } catch { throw new Error('Server returned an invalid result.'); }
+  const expectedPath = `/outputs/${videoId}.${extension}`;
+  if (candidate.origin !== window.location.origin || candidate.pathname !== expectedPath || candidate.search || candidate.hash) {
     throw new Error('Server returned an invalid result.');
   }
+  return expectedPath;
+}
+
+function validateResultPayload(data) {
+  if (!data || typeof data !== 'object' || !UUID_V4_PATTERN.test(data.videoId || '')) throw new Error('Server returned an invalid result.');
+  const videoId = data.videoId;
+  return {
+    ...data,
+    videoId,
+    gif: validateOutputPath(data.gif, videoId, 'gif'),
+    video: validateOutputPath(data.video, videoId, 'mp4'),
+    webm: validateOutputPath(data.webm, videoId, 'webm', true),
+  };
+}
+
+function displayResults(data) {
   currentResult = data;
   gifImg.src = data.gif; videoPlayer.src = data.video;
   const hasWebm = typeof data.webm === 'string' && data.webm.length > 0;
@@ -178,12 +206,19 @@ copyLinkBtn.addEventListener('click', async () => {
   const format = shareFormat.value;
   if (!currentResult[format === 'video' ? 'video' : format]) return;
   const shareUrl = `${window.location.origin}/share/${encodeURIComponent(currentResult.videoId)}?f=${encodeURIComponent(format)}`;
-  try { await navigator.clipboard.writeText(shareUrl); }
+  let copied = false;
+  try { await navigator.clipboard.writeText(shareUrl); copied = true; }
   catch {
-    const textArea = document.createElement('textarea'); textArea.value = shareUrl; document.body.appendChild(textArea);
-    textArea.select(); document.execCommand('copy'); textArea.remove();
+    const textArea = document.createElement('textarea');
+    try {
+      textArea.value = shareUrl; document.body.appendChild(textArea); textArea.select();
+      copied = document.execCommand('copy');
+    } catch { copied = false; }
+    finally { textArea.remove(); }
   }
-  shareSection.querySelector('p').textContent = `${format.toUpperCase()} link copied to clipboard!`;
+  shareSection.querySelector('p').textContent = copied
+    ? `${format.toUpperCase()} link copied to clipboard!`
+    : 'Unable to copy link. Please copy it from the address bar.';
   shareSection.classList.remove('hidden'); clearTimeout(shareTimer);
   shareTimer = setTimeout(() => shareSection.classList.add('hidden'), 3000);
 });
@@ -196,4 +231,4 @@ function hideAllSections() {
   errorSection.classList.add('hidden'); shareSection.classList.add('hidden');
 }
 
-window.addEventListener('beforeunload', cleanupRun);
+window.addEventListener('beforeunload', () => cleanupRun(activeRun));
