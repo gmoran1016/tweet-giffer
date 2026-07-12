@@ -14,6 +14,7 @@ test.before(async () => {
   process.env.OUTPUT_DIR = path.join(root, 'outputs');
   process.env.TEMP_DIR = path.join(root, 'temp');
   process.env.MAX_CONCURRENT_JOBS = '1';
+  process.env.RATE_LIMIT = '100';
   const api = require('../server');
   server = await api.startServer({ port: 0, prewarm: false });
   base = `http://127.0.0.1:${server.address().port}`;
@@ -97,6 +98,7 @@ test('share fallback selects an existing WebM-only output', async () => {
   assert.equal(response.status, 200);
   assert.match(html, new RegExp(`${id}\\.webm`));
   assert.doesNotMatch(html, new RegExp(`${id}\\.gif`));
+  assert.doesNotMatch(html, new RegExp(`${id}\\.mp4`));
 });
 
 test('capacity rejects concurrent work and setup failure releases the slot', async () => {
@@ -158,6 +160,49 @@ test('health responses use defensive and non-cache headers', async () => {
   assert.equal(response.headers.get('x-powered-by'), null);
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('cache-control'), 'no-store');
+});
+
+test('stopServer closes active SSE clients and settles promptly', async () => {
+  const api = require('../server');
+  const originalMkdir = fs.mkdir;
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let rejectSetup;
+  fs.mkdir = async (target, options) => {
+    if (path.dirname(target) === process.env.TEMP_DIR) {
+      return new Promise((resolve, reject) => { rejectSetup = reject; });
+    }
+    return originalMkdir(target, options);
+  };
+
+  try {
+    const submitted = await fetch(`${base}/api/process-tweet`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://x.com/alice/status/2001' }),
+    });
+    const { jobId } = await submitted.json();
+    const sseResponse = await new Promise((resolve, reject) => {
+      const request = http.get(`${base}/api/progress/${jobId}`, resolve);
+      request.on('error', reject);
+    });
+    sseResponse.resume();
+    const streamEnded = new Promise(resolve => {
+      sseResponse.once('end', resolve);
+      sseResponse.once('close', resolve);
+    });
+    await Promise.race([
+      api.stopServer(),
+      new Promise((resolve, reject) => setTimeout(() => reject(new Error('shutdown timed out')), 500)),
+    ]);
+    await streamEnded;
+    rejectSetup(new Error('forced setup stop'));
+    await new Promise(resolve => setImmediate(resolve));
+    server = await api.startServer({ port: 0, prewarm: false });
+    base = `http://127.0.0.1:${server.address().port}`;
+  } finally {
+    fs.mkdir = originalMkdir;
+    console.error = originalConsoleError;
+  }
 });
 
 test('failed listen rolls back lifecycle state and allows a later start', async () => {

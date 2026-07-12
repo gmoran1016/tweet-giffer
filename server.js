@@ -53,7 +53,7 @@ function delay(ms) {
 
 // ─── Rate limiting (3 requests/IP/minute) ───────────────────────────────────
 const rateLimitMap = new Map(); // ip -> { count, resetAt }
-const RATE_LIMIT = 3;
+const RATE_LIMIT = Math.max(1, Number(process.env.RATE_LIMIT) || 3);
 const MAX_RATE_LIMIT_ENTRIES = Math.max(100, Number(process.env.MAX_RATE_LIMIT_ENTRIES) || 10_000);
 
 function checkRateLimit(ip) {
@@ -1048,10 +1048,10 @@ app.get('/share/:videoId', async (req, res) => {
   }
 
   const isVideo = mimeType.startsWith('video/');
-  const thumbUrl = gifExists ? gifUrl : mp4Url;
+  const thumbUrl = gifExists ? gifUrl : (mp4Exists ? mp4Url : null);
   const ogTitle = escapeHtml(authorName ? `Tweet by ${authorName}` : 'Tweet Video');
   const safeFileUrl = escapeHtml(fileUrl);
-  const safeThumbUrl = escapeHtml(thumbUrl);
+  const safeThumbUrl = thumbUrl ? escapeHtml(thumbUrl) : null;
   const safeTweetUrl = tweetUrl && parseTweetUrl(tweetUrl) ? escapeHtml(parseTweetUrl(tweetUrl).canonicalUrl) : null;
   const safeMimeType = escapeHtml(mimeType);
 
@@ -1062,7 +1062,7 @@ app.get('/share/:videoId', async (req, res) => {
   <title>${ogTitle}</title>
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
   <meta property="og:title" content="${ogTitle}" />
-  <meta property="og:image" content="${safeThumbUrl}" />
+  ${safeThumbUrl ? `<meta property="og:image" content="${safeThumbUrl}" />` : ''}
   ${safeTweetUrl ? `<meta property="og:url" content="${safeTweetUrl}" />` : ''}
   ${isVideo ? `
   <meta property="og:video" content="${safeFileUrl}" />
@@ -1149,9 +1149,19 @@ async function startServer(options = {}) {
 
 async function stopServer() {
   clearLifecycleTimers();
+  for (const job of jobs.values()) {
+    for (const client of job.clients) {
+      try { client.end(); } catch {}
+    }
+    job.clients = [];
+  }
   const server = httpServer;
   httpServer = null;
-  if (server) await new Promise(resolve => server.close(resolve));
+  if (server) {
+    const closed = new Promise(resolve => server.close(resolve));
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    await closed;
+  }
   if (_browser) await _browser.close().catch(() => {});
   _browser = null;
 }
