@@ -15,6 +15,12 @@ body {
   color: #333;
 }
 
+.skip-link { position: fixed; top: 8px; left: 8px; z-index: 10; padding: 10px 14px; background: #fff; color: #124e78; border-radius: 6px; transform: translateY(-150%); }
+.skip-link:focus { transform: translateY(0); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+label { display: block; margin-bottom: 8px; font-weight: 650; color: #263746; }
+.field-hint { margin-top: 8px; color: #526574; font-size: 0.9rem; }
+
 .container {
   background: white;
   border-radius: 20px;
@@ -73,9 +79,10 @@ header h1 {
 }
 
 #tweetUrl:focus {
-  outline: none;
   border-color: #1da1f2;
 }
+
+:focus-visible { outline: 3px solid #0b6ca8; outline-offset: 3px; }
 
 .btn-primary {
   padding: 15px 30px;
@@ -118,10 +125,14 @@ header h1 {
   color: white;
 }
 
+button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform: none; box-shadow: none; }
+
 .loading-section {
   text-align: center;
   padding: 40px 20px;
 }
+
+.loading-section, .error-section, .share-section { margin-block: 20px; }
 
 .spinner {
   width: 50px;
@@ -249,7 +260,7 @@ header h1 {
   padding: 15px;
   background: #e8f5e9;
   border-radius: 8px;
-  color: #2e7d32;
+  color: #175b1e;
   font-weight: 600;
 }
 
@@ -257,7 +268,7 @@ header h1 {
   padding: 20px;
   background: #ffebee;
   border-radius: 8px;
-  color: #c62828;
+  color: #8b1010;
   text-align: center;
 }
 
@@ -273,6 +284,7 @@ footer {
 }
 
 @media (max-width: 600px) {
+  body { align-items: flex-start; padding: 10px; }
   .container {
     padding: 20px;
   }
@@ -296,4 +308,14 @@ footer {
   .btn-secondary {
     width: 100%;
   }
+
+  .preview-content { min-height: 220px; padding: 10px; }
+  .preview img, .preview video { max-height: 65vh; object-fit: contain; }
+  .share-group { width: 100%; }
+  .share-select { flex: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .spinner { animation: none; border-top-color: #657786; }
 }

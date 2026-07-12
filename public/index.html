@@ -7,81 +7,76 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <a class="skip-link" href="#tweetForm">Skip to tweet form</a>
   <div class="container">
     <header>
       <h1>🐦 Tweet Giffer</h1>
       <p class="subtitle">Convert Twitter/X tweets into shareable GIFs and videos</p>
     </header>
 
-    <main>
-      <div class="input-section">
-        <div class="input-group">
-          <input
-            type="url"
-            id="tweetUrl"
-            placeholder="Paste Twitter/X URL here (e.g., https://twitter.com/username/status/123456)"
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck="false"
-          >
-          <button id="processBtn" class="btn-primary">Create GIF/Video</button>
-        </div>
-      </div>
+    <main id="mainContent">
+      <section class="input-section" aria-labelledby="formHeading">
+        <h2 id="formHeading" class="visually-hidden">Create media from a tweet</h2>
+        <form id="tweetForm" novalidate>
+          <label for="tweetUrl">Twitter or X post URL</label>
+          <div class="input-group">
+            <input type="url" id="tweetUrl" name="tweetUrl"
+              placeholder="https://x.com/username/status/123456"
+              autocomplete="url" autocorrect="off" autocapitalize="off" spellcheck="false"
+              aria-describedby="urlHint" required>
+            <button type="submit" id="processBtn" class="btn-primary">Create GIF/Video</button>
+          </div>
+          <p id="urlHint" class="field-hint">Paste a post URL from twitter.com, www.twitter.com, x.com, or www.x.com.</p>
+        </form>
+      </section>
 
-      <div id="loadingSection" class="loading-section hidden">
-        <div class="spinner"></div>
+      <section id="loadingSection" class="loading-section hidden" role="status" aria-live="polite" aria-atomic="true">
+        <div class="spinner" aria-hidden="true"></div>
         <p id="loadingStatus">Processing tweet... This may take a moment.</p>
-      </div>
+      </section>
 
-      <div id="resultSection" class="result-section hidden">
-        <h2>Your tweet is ready!</h2>
+      <section id="resultSection" class="result-section hidden" aria-labelledby="resultHeading" tabindex="-1">
+        <h2 id="resultHeading">Your tweet is ready!</h2>
         <div class="preview-container">
-          <div class="preview-tabs">
-            <button class="tab-btn active" data-tab="gif">GIF</button>
-            <button class="tab-btn" data-tab="video">Video (MP4)</button>
-            <button class="tab-btn" data-tab="webm">WebM</button>
+          <div class="preview-tabs" role="tablist" aria-label="Preview format">
+            <button type="button" id="gifTab" class="tab-btn active" role="tab" data-tab="gif" aria-selected="true" aria-controls="gifPreview" tabindex="0">GIF</button>
+            <button type="button" id="videoTab" class="tab-btn" role="tab" data-tab="video" aria-selected="false" aria-controls="videoPreview" tabindex="-1">Video (MP4)</button>
+            <button type="button" id="webmTab" class="tab-btn" role="tab" data-tab="webm" aria-selected="false" aria-controls="webmPreview" tabindex="-1">WebM</button>
           </div>
           <div class="preview-content">
-            <div id="gifPreview" class="preview active">
-              <img id="gifImg" src="" alt="Tweet GIF">
+            <div id="gifPreview" class="preview active" role="tabpanel" aria-labelledby="gifTab">
+              <img id="gifImg" alt="Animated preview of the converted tweet">
             </div>
-            <div id="videoPreview" class="preview">
-              <video id="videoPlayer" controls></video>
+            <div id="videoPreview" class="preview" role="tabpanel" aria-labelledby="videoTab" hidden>
+              <video id="videoPlayer" controls aria-label="MP4 preview of the converted tweet"></video>
             </div>
-            <div id="webmPreview" class="preview">
-              <video id="webmPlayer" controls></video>
+            <div id="webmPreview" class="preview" role="tabpanel" aria-labelledby="webmTab" hidden>
+              <video id="webmPlayer" controls aria-label="WebM preview of the converted tweet"></video>
             </div>
           </div>
         </div>
-        <div class="action-buttons">
-          <button id="downloadGifBtn" class="btn-secondary">Download GIF</button>
-          <button id="downloadVideoBtn" class="btn-secondary">Download MP4</button>
-          <button id="downloadWebmBtn" class="btn-secondary">Download WebM</button>
+        <div class="action-buttons" aria-label="Download and share options">
+          <button type="button" id="downloadGifBtn" class="btn-secondary">Download GIF</button>
+          <button type="button" id="downloadVideoBtn" class="btn-secondary">Download MP4</button>
+          <button type="button" id="downloadWebmBtn" class="btn-secondary">Download WebM</button>
           <div class="share-group">
+            <label for="shareFormat" class="visually-hidden">Share format</label>
             <select id="shareFormat" class="share-select">
-              <option value="gif">GIF</option>
-              <option value="video">MP4</option>
-              <option value="webm">WebM</option>
+              <option value="gif">GIF</option><option value="video">MP4</option><option value="webm">WebM</option>
             </select>
-            <button id="copyLinkBtn" class="btn-secondary">Copy Link</button>
+            <button type="button" id="copyLinkBtn" class="btn-secondary">Copy Link</button>
           </div>
         </div>
-        <div id="shareSection" class="share-section hidden">
-          <p>Share link copied to clipboard!</p>
-        </div>
-      </div>
+        <div id="shareSection" class="share-section hidden" role="status" aria-live="polite"><p></p></div>
+      </section>
 
-      <div id="errorSection" class="error-section hidden">
+      <section id="errorSection" class="error-section hidden" role="alert" aria-atomic="true" tabindex="-1">
         <p id="errorMessage"></p>
-      </div>
+      </section>
     </main>
 
-    <footer>
-      <p>Note: Processing may take 30-60 seconds depending on media content.</p>
-    </footer>
+    <footer><p>Note: Processing may take 30-60 seconds depending on media content.</p></footer>
   </div>
-
   <script src="script.js"></script>
 </body>
 </html>
