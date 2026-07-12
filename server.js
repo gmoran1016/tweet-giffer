@@ -9,6 +9,7 @@ const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
 const ffmpeg = require('fluent-ffmpeg');
 const { spawn, execSync, execFile } = require('child_process');
+const { parseTweetUrl, isSafeRemoteUrl, escapeHtml, isUuid } = require('./lib/security');
 
 let ffmpegPath;
 try {
@@ -20,12 +21,21 @@ try {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+app.set('trust proxy', /^(1|true)$/i.test(process.env.TRUST_PROXY || ''));
+if (process.env.CORS_ORIGIN) app.use(cors({ origin: process.env.CORS_ORIGIN }));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (req.path.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+app.use(express.json({ limit: '4kb' }));
 app.use(express.static('public'));
 
-const outputDir = path.join(__dirname, 'outputs');
-const tempDir = path.join(__dirname, 'temp');
+const outputDir = path.resolve(process.env.OUTPUT_DIR || path.join(__dirname, 'outputs'));
+const tempDir = path.resolve(process.env.TEMP_DIR || path.join(__dirname, 'temp'));
 
 async function ensureDirectories() {
   await fs.mkdir(outputDir, { recursive: true });
@@ -44,9 +54,16 @@ function delay(ms) {
 // ─── Rate limiting (3 requests/IP/minute) ───────────────────────────────────
 const rateLimitMap = new Map(); // ip -> { count, resetAt }
 const RATE_LIMIT = 3;
+const MAX_RATE_LIMIT_ENTRIES = Math.max(100, Number(process.env.MAX_RATE_LIMIT_ENTRIES) || 10_000);
 
 function checkRateLimit(ip) {
   const now = Date.now();
+  for (const [key, value] of rateLimitMap) {
+    if (value.resetAt < now) rateLimitMap.delete(key);
+  }
+  if (!rateLimitMap.has(ip) && rateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
+    rateLimitMap.delete(rateLimitMap.keys().next().value);
+  }
   let entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetAt) {
     entry = { count: 0, resetAt: now + 60_000 };
@@ -61,9 +78,12 @@ const tweetCache = new Map(); // tweetId -> videoId
 
 // ─── Job progress tracking (SSE) ────────────────────────────────────────────
 const jobs = new Map(); // jobId -> { steps, result, error, clients }
+const JOB_TTL_MS = Math.max(1000, Number(process.env.JOB_TTL_MS) || 5 * 60_000);
+const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 2);
+let activeJobs = 0;
 
 function createJob(jobId) {
-  jobs.set(jobId, { steps: [], result: null, error: null, clients: [] });
+  jobs.set(jobId, { steps: [], result: null, error: null, clients: [], expiresAt: Date.now() + JOB_TTL_MS });
 }
 
 function emitProgress(jobId, data) {
@@ -84,7 +104,7 @@ function resolveJob(jobId, result) {
     try { client.write(msg); client.end(); } catch {}
   }
   job.clients = [];
-  setTimeout(() => jobs.delete(jobId), 5 * 60_000);
+  job.expiresAt = Date.now() + JOB_TTL_MS;
 }
 
 function rejectJob(jobId, error) {
@@ -96,7 +116,7 @@ function rejectJob(jobId, error) {
     try { client.write(msg); client.end(); } catch {}
   }
   job.clients = [];
-  setTimeout(() => jobs.delete(jobId), 5 * 60_000);
+  job.expiresAt = Date.now() + JOB_TTL_MS;
 }
 
 // ─── Auto-cleanup of old output files (24h) ─────────────────────────────────
@@ -199,13 +219,6 @@ function toFileUrl(p) {
   return 'file:///' + path.resolve(p).replace(/\\/g, '/');
 }
 
-// Extract tweet ID and username from URL
-function parseTweetUrl(url) {
-  const match = url.match(/(?:twitter\.com|x\.com)\/(\w+)\/status\/(\d+)/i);
-  if (!match) return null;
-  return { username: match[1], tweetId: match[2] };
-}
-
 // Derive tweet date from Twitter snowflake ID
 // Formula: (id >> 22) + Twitter epoch (Nov 4 2010 01:42:54.657 UTC)
 function tweetDateFromId(tweetId) {
@@ -263,7 +276,14 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
     const proc = spawn(YT_DLP, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    proc.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-8192); });
     proc.stdout.on('data', d => { process.stdout.write(d); });
 
     proc.on('close', async (code) => {
@@ -274,22 +294,22 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
           const fullPath = path.join(sessionDir, videoFile);
           const stats = await fs.stat(fullPath);
           if (stats.size > 10000) {
-            return resolve(fullPath);
+            return finish(resolve, fullPath);
           }
         }
-        reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
+        finish(reject, new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
       } catch (e) {
-        reject(e);
+        finish(reject, e);
       }
     });
 
     proc.on('error', err => {
-      reject(new Error(`yt-dlp not available: ${err.message}`));
+      finish(reject, new Error(`yt-dlp not available: ${err.message}`));
     });
 
-    setTimeout(() => {
-      proc.kill();
-      reject(new Error('yt-dlp timed out after 120s'));
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      finish(reject, new Error('yt-dlp timed out after 120s'));
     }, 120000);
   });
 }
@@ -346,11 +366,22 @@ async function getVideoInfo(videoPath) {
 
 // Download a file (image/avatar)
 async function downloadFile(url, filePath) {
-  const response = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: 10000,
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' }
-  });
+  const allowedHosts = new Set(['unavatar.io', 'pbs.twimg.com', 'video.twimg.com', 'abs.twimg.com']);
+  let currentUrl = url;
+  let response;
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    if (!isSafeRemoteUrl(currentUrl, allowedHosts)) throw new Error('Unsafe remote media URL');
+    response = await axios.get(currentUrl, {
+      responseType: 'arraybuffer', timeout: 10000,
+      maxContentLength: 10 * 1024 * 1024, maxBodyLength: 10 * 1024 * 1024,
+      maxRedirects: 0, validateStatus: status => status >= 200 && status < 400,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' },
+    });
+    if (response.status < 300) break;
+    const location = response.headers.location;
+    if (!location || redirects === 3) throw new Error('Too many remote media redirects');
+    currentUrl = new URL(location, currentUrl).href;
+  }
   await fs.writeFile(filePath, Buffer.from(response.data));
   return filePath;
 }
@@ -705,6 +736,7 @@ function videoToWebm(videoPath, webmPath) {
 
 // ─── SSE progress endpoint (with proxy-busting headers + keepalive heartbeat) ─
 app.get('/api/progress/:jobId', (req, res) => {
+  if (!isUuid(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID' });
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
@@ -743,6 +775,7 @@ app.get('/api/progress/:jobId', (req, res) => {
 // ─── Polling status endpoint (proxy-safe alternative to SSE) ─────────────────
 // Client polls this every 2s instead of using EventSource when behind a proxy.
 app.get('/api/status/:jobId', (req, res) => {
+  if (!isUuid(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID' });
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json({
@@ -767,7 +800,7 @@ app.post('/api/process-tweet', async (req, res) => {
     return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
   }
 
-  const { username, tweetId } = parsed;
+  const { username, tweetId, canonicalUrl } = parsed;
 
   // Cache check — return existing output if files are still on disk
   const cachedVideoId = tweetCache.get(tweetId);
@@ -789,15 +822,21 @@ app.post('/api/process-tweet', async (req, res) => {
     tweetCache.delete(tweetId); // stale entry
   }
 
+  if (activeJobs >= MAX_CONCURRENT_JOBS) {
+    return res.status(503).json({ error: 'Conversion capacity is full. Please try again later.' });
+  }
+
   // Return jobId immediately; process async so the client can stream progress
   const jobId = uuidv4();
   createJob(jobId);
+  activeJobs++;
   res.json({ success: true, jobId });
 
   // ── Async processing ──────────────────────────────────────────────────────
   (async () => {
     const sessionId = uuidv4();
     const sessionDir = path.join(tempDir, sessionId);
+    const partialOutputs = [];
     await fs.mkdir(sessionDir, { recursive: true });
 
     try {
@@ -805,7 +844,7 @@ app.post('/api/process-tweet', async (req, res) => {
 
       // 1. Fetch tweet metadata
       emitProgress(jobId, { type: 'step', message: 'Fetching tweet metadata...' });
-      const oembedData = await fetchOEmbed(url);
+      const oembedData = await fetchOEmbed(canonicalUrl);
       const tweetText = extractTweetText(oembedData.html);
       const authorName = oembedData.author_name || username;
       const tweetDate = tweetDateFromId(tweetId);
@@ -817,7 +856,7 @@ app.post('/api/process-tweet', async (req, res) => {
       let videoPath = null;
       let videoInfo = null;
       try {
-        videoPath = await downloadVideoYtDlp(url, sessionDir);
+        videoPath = await downloadVideoYtDlp(canonicalUrl, sessionDir);
         videoInfo = await getVideoInfo(videoPath);
         console.log(`  Video: ${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s, audio=${videoInfo.hasAudio}`);
       } catch (err) {
@@ -883,6 +922,7 @@ app.post('/api/process-tweet', async (req, res) => {
       emitProgress(jobId, { type: 'step', message: 'Compositing video...' });
       const videoId = uuidv4();
       const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
+      partialOutputs.push(outputVideoPath);
 
       if (videoPath && videoArea) {
         console.log(`Compositing tweet frame with video (audio=${videoInfo.hasAudio}, rotation=${videoInfo.rotation})...`);
@@ -896,6 +936,7 @@ app.post('/api/process-tweet', async (req, res) => {
       // 8. Convert to GIF
       emitProgress(jobId, { type: 'step', message: 'Creating GIF...' });
       const gifPath = path.join(outputDir, `${videoId}.gif`);
+      partialOutputs.push(gifPath);
       try {
         await videoToGif(outputVideoPath, gifPath, cardWidth);
         console.log('  GIF created');
@@ -915,6 +956,7 @@ app.post('/api/process-tweet', async (req, res) => {
       // 9. Convert to WebM
       emitProgress(jobId, { type: 'step', message: 'Creating WebM...' });
       const webmPath = path.join(outputDir, `${videoId}.webm`);
+      partialOutputs.push(webmPath);
       try {
         await videoToWebm(outputVideoPath, webmPath);
         console.log('  WebM created');
@@ -927,7 +969,7 @@ app.post('/api/process-tweet', async (req, res) => {
 
       // Save metadata so the share page can link back to the original tweet
       const metaPath = path.join(outputDir, `${videoId}.json`);
-      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: url, authorName }), 'utf8').catch(() => {});
+      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: canonicalUrl, authorName }), 'utf8').catch(() => {});
 
       // Store in cache
       tweetCache.set(tweetId, videoId);
@@ -943,7 +985,10 @@ app.post('/api/process-tweet', async (req, res) => {
     } catch (error) {
       console.error('Error processing tweet:', error);
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+      await Promise.all(partialOutputs.map(file => fs.rm(file, { force: true }).catch(() => {})));
       rejectJob(jobId, error.message || 'Failed to process tweet');
+    } finally {
+      activeJobs = Math.max(0, activeJobs - 1);
     }
   })();
 });
@@ -955,7 +1000,9 @@ app.use('/outputs', express.static(outputDir));
 // Usage: /share/:videoId?f=video  (f = gif | video | webm, defaults to video)
 app.get('/share/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const format = req.query.f || 'video';
+  if (!isUuid(videoId)) return res.status(400).send('Invalid output ID');
+  const requestedFormat = typeof req.query.f === 'string' ? req.query.f : 'video';
+  const format = new Set(['video', 'gif', 'webm']).has(requestedFormat) ? requestedFormat : 'video';
 
   const mp4Exists  = fsSync.existsSync(path.join(outputDir, `${videoId}.mp4`));
   const gifExists  = fsSync.existsSync(path.join(outputDir, `${videoId}.gif`));
@@ -973,7 +1020,16 @@ app.get('/share/:videoId', async (req, res) => {
     ({ tweetUrl, authorName } = JSON.parse(raw));
   } catch {}
 
-  const base = `${req.protocol}://${req.get('host')}`;
+  let base;
+  try {
+    const configured = process.env.PUBLIC_BASE_URL;
+    const candidate = configured || `${req.protocol}://${req.get('host')}`;
+    const parsedBase = new URL(candidate);
+    if (!['http:', 'https:'].includes(parsedBase.protocol) || parsedBase.username || parsedBase.password) throw new Error();
+    base = parsedBase.origin;
+  } catch {
+    return res.status(400).send('Invalid request origin');
+  }
   const mp4Url  = `${base}/outputs/${videoId}.mp4`;
   const gifUrl  = `${base}/outputs/${videoId}.gif`;
   const webmUrl = `${base}/outputs/${videoId}.webm`;
@@ -991,7 +1047,11 @@ app.get('/share/:videoId', async (req, res) => {
 
   const isVideo = mimeType.startsWith('video/');
   const thumbUrl = gifExists ? gifUrl : mp4Url;
-  const ogTitle = authorName ? `Tweet by ${authorName}` : 'Tweet Video';
+  const ogTitle = escapeHtml(authorName ? `Tweet by ${authorName}` : 'Tweet Video');
+  const safeFileUrl = escapeHtml(fileUrl);
+  const safeThumbUrl = escapeHtml(thumbUrl);
+  const safeTweetUrl = tweetUrl && parseTweetUrl(tweetUrl) ? escapeHtml(parseTweetUrl(tweetUrl).canonicalUrl) : null;
+  const safeMimeType = escapeHtml(mimeType);
 
   const html = `<!DOCTYPE html>
 <html>
@@ -1000,13 +1060,13 @@ app.get('/share/:videoId', async (req, res) => {
   <title>${ogTitle}</title>
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
   <meta property="og:title" content="${ogTitle}" />
-  <meta property="og:image" content="${thumbUrl}" />
-  ${tweetUrl ? `<meta property="og:url" content="${tweetUrl}" />` : ''}
+  <meta property="og:image" content="${safeThumbUrl}" />
+  ${safeTweetUrl ? `<meta property="og:url" content="${safeTweetUrl}" />` : ''}
   ${isVideo ? `
-  <meta property="og:video" content="${fileUrl}" />
-  <meta property="og:video:url" content="${fileUrl}" />
-  <meta property="og:video:secure_url" content="${fileUrl}" />
-  <meta property="og:video:type" content="${mimeType}" />
+  <meta property="og:video" content="${safeFileUrl}" />
+  <meta property="og:video:url" content="${safeFileUrl}" />
+  <meta property="og:video:secure_url" content="${safeFileUrl}" />
+  <meta property="og:video:type" content="${safeMimeType}" />
   <meta property="og:video:width" content="598" />
   ${mp4Exists && mimeType !== 'video/mp4' ? `
   <meta property="og:video" content="${mp4Url}" />
@@ -1017,33 +1077,75 @@ app.get('/share/:videoId', async (req, res) => {
   ` : ''}
 </head>
 <body>
-  <script>window.location.replace('${fileUrl}');</script>
-  <p>Redirecting… <a href="${fileUrl}">Click here if not redirected</a></p>
-  ${tweetUrl ? `<p><a href="${tweetUrl}">View original tweet</a></p>` : ''}
+  <script>window.location.replace(${JSON.stringify(fileUrl).replaceAll('<', '\\u003c')});</script>
+  <noscript><meta http-equiv="refresh" content="0;url=${safeFileUrl}"></noscript>
+  <p>Redirecting… <a href="${safeFileUrl}">Click here if not redirected</a></p>
+  ${safeTweetUrl ? `<p><a href="${safeTweetUrl}">View original tweet</a></p>` : ''}
 </body>
 </html>`;
 
-  res.setHeader('Content-Type', 'text/html');
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
   res.send(html);
 });
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-async function startServer() {
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large' });
+  if (err instanceof SyntaxError && err.status === 400) return res.status(400).json({ error: 'Malformed JSON' });
+  return next(err);
+});
+
+let httpServer = null;
+let cleanupTimer = null;
+let jobTimer = null;
+
+async function startServer(options = {}) {
+  if (httpServer) return httpServer;
   await ensureDirectories();
 
   // Pre-warm browser so first request doesn't pay the launch cost
-  getBrowser().catch(e => console.warn('Browser pre-warm failed:', e.message));
+  if (options.prewarm !== false) getBrowser().catch(e => console.warn('Browser pre-warm failed:', e.message));
 
   // Auto-cleanup: remove output files older than 24 hours
   cleanOldOutputs();
-  setInterval(() => cleanOldOutputs(), 3_600_000);
+  cleanupTimer = setInterval(() => cleanOldOutputs(), 3_600_000);
+  jobTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, job] of jobs) if (job.expiresAt <= now && job.clients.length === 0) jobs.delete(id);
+  }, Math.min(JOB_TTL_MS, 60_000));
 
-  app.listen(PORT, () => {
-    const { version } = require('./package.json');
-    console.log(`\nTweet Giffer v${version} running at http://localhost:${PORT}`);
-    console.log('Requires: yt-dlp installed and in PATH (https://github.com/yt-dlp/yt-dlp)\n');
+  const port = options.port ?? PORT;
+  await new Promise((resolve, reject) => {
+    httpServer = app.listen(port, resolve);
+    httpServer.once('error', reject);
   });
+  {
+    const { version } = require('./package.json');
+    console.log(`\nTweet Giffer v${version} running at http://localhost:${httpServer.address().port}`);
+    console.log('Requires: yt-dlp installed and in PATH (https://github.com/yt-dlp/yt-dlp)\n');
+  }
+  return httpServer;
 }
 
-startServer();
+async function stopServer() {
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  if (jobTimer) clearInterval(jobTimer);
+  cleanupTimer = null;
+  jobTimer = null;
+  const server = httpServer;
+  httpServer = null;
+  if (server) await new Promise(resolve => server.close(resolve));
+  if (_browser) await _browser.close().catch(() => {});
+  _browser = null;
+}
+
+if (require.main === module) {
+  startServer().catch(error => { console.error(error); process.exitCode = 1; });
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => stopServer().finally(() => process.exit(0)));
+  }
+}
+
+module.exports = { app, startServer, stopServer };
