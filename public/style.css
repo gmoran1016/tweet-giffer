@@ -262,6 +262,8 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   border-radius: 8px;
   color: #175b1e;
   font-weight: 600;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .error-section {

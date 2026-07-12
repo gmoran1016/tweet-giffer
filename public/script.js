@@ -218,9 +218,9 @@ copyLinkBtn.addEventListener('click', async () => {
   }
   shareSection.querySelector('p').textContent = copied
     ? `${format.toUpperCase()} link copied to clipboard!`
-    : 'Unable to copy link. Please copy it from the address bar.';
+    : `Unable to copy automatically. Copy this link manually: ${shareUrl}`;
   shareSection.classList.remove('hidden'); clearTimeout(shareTimer);
-  shareTimer = setTimeout(() => shareSection.classList.add('hidden'), 3000);
+  shareTimer = copied ? setTimeout(() => shareSection.classList.add('hidden'), 3000) : null;
 });
 
 function showLoading(message) { loadingStatus.textContent = message; loadingSection.classList.remove('hidden'); }

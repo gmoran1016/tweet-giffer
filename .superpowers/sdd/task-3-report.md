@@ -33,3 +33,4 @@
 - Made clipboard fallback check `execCommand('copy')`, catch fallback errors, and announce a failure message instead of claiming success.
 - Review regression checks followed a red/green cycle: 4 expected failures before the fixes, then 4 passes. The temporary focused test was removed after verification.
 - Fresh follow-up verification: `npm run check` and `git diff --check` passed. Browser smoke remains deferred to the parent agent.
+- Final clipboard correction: when both Clipboard API and legacy copy fallback fail, the live region now displays the exact generated share URL for manual selection and leaves it visible. The share feedback styling permits selection and safely wraps long URLs. A focused regression check failed before the correction and passed afterward; `npm run check` and `git diff --check` were rerun. Browser smoke remains deferred.
