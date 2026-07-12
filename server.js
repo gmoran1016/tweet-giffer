@@ -837,9 +837,9 @@ app.post('/api/process-tweet', async (req, res) => {
     const sessionId = uuidv4();
     const sessionDir = path.join(tempDir, sessionId);
     const partialOutputs = [];
-    await fs.mkdir(sessionDir, { recursive: true });
 
     try {
+      await fs.mkdir(sessionDir, { recursive: true });
       console.log(`\n── Processing tweet ${tweetId} by @${username} (job ${jobId}) ──`);
 
       // 1. Fetch tweet metadata
@@ -961,6 +961,7 @@ app.post('/api/process-tweet', async (req, res) => {
         await videoToWebm(outputVideoPath, webmPath);
         console.log('  WebM created');
       } catch (webmErr) {
+        await fs.rm(webmPath, { force: true }).catch(() => {});
         console.warn(`  WebM conversion failed: ${webmErr.message}`);
       }
 
@@ -1022,8 +1023,7 @@ app.get('/share/:videoId', async (req, res) => {
 
   let base;
   try {
-    const configured = process.env.PUBLIC_BASE_URL;
-    const candidate = configured || `${req.protocol}://${req.get('host')}`;
+    const candidate = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
     const parsedBase = new URL(candidate);
     if (!['http:', 'https:'].includes(parsedBase.protocol) || parsedBase.username || parsedBase.password) throw new Error();
     base = parsedBase.origin;
@@ -1041,8 +1041,10 @@ app.get('/share/:videoId', async (req, res) => {
     fileUrl = gifUrl; mimeType = 'image/gif';
   } else if (mp4Exists) {
     fileUrl = mp4Url; mimeType = 'video/mp4';
-  } else {
+  } else if (gifExists) {
     fileUrl = gifUrl; mimeType = 'image/gif';
+  } else {
+    fileUrl = webmUrl; mimeType = 'video/webm';
   }
 
   const isVideo = mimeType.startsWith('video/');
@@ -1101,6 +1103,13 @@ let httpServer = null;
 let cleanupTimer = null;
 let jobTimer = null;
 
+function clearLifecycleTimers() {
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  if (jobTimer) clearInterval(jobTimer);
+  cleanupTimer = null;
+  jobTimer = null;
+}
+
 async function startServer(options = {}) {
   if (httpServer) return httpServer;
   await ensureDirectories();
@@ -1117,10 +1126,19 @@ async function startServer(options = {}) {
   }, Math.min(JOB_TTL_MS, 60_000));
 
   const port = options.port ?? PORT;
-  await new Promise((resolve, reject) => {
-    httpServer = app.listen(port, resolve);
-    httpServer.once('error', reject);
-  });
+  const candidateServer = app.listen(port);
+  try {
+    await new Promise((resolve, reject) => {
+      candidateServer.once('listening', resolve);
+      candidateServer.once('error', reject);
+    });
+    httpServer = candidateServer;
+  } catch (error) {
+    clearLifecycleTimers();
+    if (candidateServer.listening) await new Promise(resolve => candidateServer.close(resolve));
+    httpServer = null;
+    throw error;
+  }
   {
     const { version } = require('./package.json');
     console.log(`\nTweet Giffer v${version} running at http://localhost:${httpServer.address().port}`);
@@ -1130,10 +1148,7 @@ async function startServer(options = {}) {
 }
 
 async function stopServer() {
-  if (cleanupTimer) clearInterval(cleanupTimer);
-  if (jobTimer) clearInterval(jobTimer);
-  cleanupTimer = null;
-  jobTimer = null;
+  clearLifecycleTimers();
   const server = httpServer;
   httpServer = null;
   if (server) await new Promise(resolve => server.close(resolve));

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const http = require('node:http');
 
 let root;
 let server;
@@ -12,10 +13,23 @@ test.before(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'tweet-giffer-'));
   process.env.OUTPUT_DIR = path.join(root, 'outputs');
   process.env.TEMP_DIR = path.join(root, 'temp');
+  process.env.MAX_CONCURRENT_JOBS = '1';
   const api = require('../server');
   server = await api.startServer({ port: 0, prewarm: false });
   base = `http://127.0.0.1:${server.address().port}`;
 });
+
+function requestWithHeaders(pathname, headers) {
+  return new Promise((resolve, reject) => {
+    const request = http.get(`${base}${pathname}`, { headers }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
+    });
+    request.on('error', reject);
+  });
+}
 
 test.after(async () => {
   await require('../server').stopServer();
@@ -62,10 +76,102 @@ test('escapes share metadata and safely falls back from unsupported formats', as
   assert.match(html, /<noscript>/);
 });
 
+test('share URLs do not reflect hostile host or forwarded headers', async () => {
+  const id = '223e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
+  const response = await requestWithHeaders(`/share/${id}`, {
+    host: 'evil.example',
+    'x-forwarded-host': 'forwarded.evil.example',
+    'x-forwarded-proto': 'https',
+  });
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(response.body, /evil\.example/);
+  assert.match(response.body, /http:\/\/localhost:/);
+});
+
+test('share fallback selects an existing WebM-only output', async () => {
+  const id = '323e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.webm`), 'media');
+  const response = await fetch(`${base}/share/${id}?f=unsupported`);
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, new RegExp(`${id}\\.webm`));
+  assert.doesNotMatch(html, new RegExp(`${id}\\.gif`));
+});
+
+test('capacity rejects concurrent work and setup failure releases the slot', async () => {
+  const originalMkdir = fs.mkdir;
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let rejectSetup;
+  let setupStartedResolve;
+  const setupStarted = new Promise(resolve => { setupStartedResolve = resolve; });
+  fs.mkdir = async (target, options) => {
+    if (path.dirname(target) === process.env.TEMP_DIR) {
+      setupStartedResolve();
+      return new Promise((resolve, reject) => { rejectSetup = reject; });
+    }
+    return originalMkdir(target, options);
+  };
+
+  try {
+    const submit = url => fetch(`${base}/api/process-tweet`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }),
+    });
+    const first = await submit('https://x.com/alice/status/1001');
+    const { jobId } = await first.json();
+    await setupStarted;
+    assert.equal((await submit('https://x.com/alice/status/1002')).status, 503);
+    rejectSetup(new Error('forced setup failure'));
+
+    let status;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      status = await (await fetch(`${base}/api/status/${jobId}`)).json();
+      if (status.error) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.match(status.error, /forced setup failure/);
+
+    fs.mkdir = async target => {
+      if (path.dirname(target) === process.env.TEMP_DIR) throw new Error('second setup failure');
+      return originalMkdir(target, { recursive: true });
+    };
+    const third = await submit('https://x.com/alice/status/1003');
+    assert.equal(third.status, 200);
+    const thirdJobId = (await third.json()).jobId;
+    let thirdStatus;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      thirdStatus = await (await fetch(`${base}/api/status/${thirdJobId}`)).json();
+      if (thirdStatus.error) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.match(thirdStatus.error, /second setup failure/);
+  } finally {
+    fs.mkdir = originalMkdir;
+    console.error = originalConsoleError;
+  }
+});
+
 test('health responses use defensive and non-cache headers', async () => {
   const response = await fetch(`${base}/api/health`);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('x-powered-by'), null);
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('cache-control'), 'no-store');
+});
+
+test('failed listen rolls back lifecycle state and allows a later start', async () => {
+  const api = require('../server');
+  await api.stopServer();
+  const blocker = http.createServer();
+  await new Promise(resolve => blocker.listen(0, resolve));
+  const occupiedPort = blocker.address().port;
+  try {
+    await assert.rejects(api.startServer({ port: occupiedPort, prewarm: false }), /EADDRINUSE/);
+  } finally {
+    await new Promise(resolve => blocker.close(resolve));
+  }
+  server = await api.startServer({ port: 0, prewarm: false });
+  base = `http://127.0.0.1:${server.address().port}`;
+  assert.equal((await fetch(`${base}/api/health`)).status, 200);
 });
