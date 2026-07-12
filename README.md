@@ -51,7 +51,7 @@ services:
 
 The image includes Chromium, FFmpeg, and yt-dlp — no separate installs needed. It runs as an unprivileged user (UID/GID 1000); only `/app/outputs` and `/app/temp` should be writable. Ensure a bind-mounted `./outputs` directory is writable by that user. `/app/temp` is ephemeral, while output files persist in the mounted output directory and are automatically deleted after 24 hours.
 
-For a public deployment, terminate TLS at a reverse proxy and forward traffic to port 3000. Set `PUBLIC_BASE_URL` to the externally visible HTTPS origin so share metadata contains correct URLs. Set `TRUST_PROXY=true` only when the app is behind a trusted proxy that overwrites forwarded headers. Restrict browser API access with `ALLOWED_ORIGIN`; do not use a wildcard for a public instance.
+For a public deployment, terminate TLS at a reverse proxy and forward traffic to the configured `PORT`. Set `PUBLIC_BASE_URL` to the externally visible HTTPS origin so share metadata contains correct URLs. Alternatively, set `PUBLIC_HOSTS` to an explicit comma-separated host allowlist; requests with other Host values receive a configuration error. Without either setting, only loopback Host values are accepted for local development. Set `TRUST_PROXY=true` only when the app is behind a trusted proxy that overwrites forwarded headers. Restrict browser API access with `ALLOWED_ORIGIN`; do not use a wildcard for a public instance.
 
 ---
 
@@ -109,7 +109,8 @@ Key dependencies: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Puppeteer](https:
 |---|---|---|
 | `PORT` | `3000` | Port the server listens on |
 | `PUPPETEER_EXECUTABLE_PATH` | *(bundled)* | Path to Chromium binary (set automatically in Docker) |
-| `PUBLIC_BASE_URL` | `http://localhost:$PORT` | Public HTTP(S) origin used in share metadata. Use an HTTPS URL in production. |
+| `PUBLIC_BASE_URL` | *(unset)* | Canonical public HTTP(S) origin used in share metadata. Takes precedence over `PUBLIC_HOSTS`. |
+| `PUBLIC_HOSTS` | *(loopback only)* | Comma-separated trusted Host names (optionally including ports) from which a share origin may be derived. |
 | `TRUST_PROXY` | `false` | Trust Express proxy headers when `true`. Enable only behind a trusted reverse proxy. |
 | `ALLOWED_ORIGIN` | *(unset)* | Exact browser origin allowed by CORS. `CORS_ORIGIN` remains a backward-compatible alias. |
 | `MAX_CONCURRENT_JOBS` | `2` | Maximum simultaneous conversion jobs. Additional requests receive HTTP 503. |
@@ -118,6 +119,7 @@ Key dependencies: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Puppeteer](https:
 | `JOB_TTL_MS` | `300000` | Completed job status retention in milliseconds (minimum 1000). |
 | `OUTPUT_DIR` | `./outputs` | Generated output directory; must be writable. |
 | `TEMP_DIR` | `./temp` | Temporary work directory; must be writable and may be ephemeral. |
+| `FFMPEG_TIMEOUT_MS` | `300000` | Maximum time for each FFmpeg pass before it is killed (minimum 5000 ms). |
 
 `MAX_CONCURRENT_JOBS` is a per-process limit, not a queue: excess work is rejected with HTTP 503 and may be retried later. Conversion is CPU-, memory-, and temporary-disk-intensive; start with the default concurrency and size `/dev/shm` and `/app/temp` for the largest expected videos.
 

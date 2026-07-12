@@ -79,10 +79,8 @@
 
 **Interfaces:**
 - Documents: `PUBLIC_BASE_URL`, `TRUST_PROXY`, `ALLOWED_ORIGIN`, `MAX_CONCURRENT_JOBS`, and operational limits.
-
 - [ ] **Step 1: Harden the image** by creating an unprivileged runtime user, owning only writable output/temp directories, adding a health check, and removing the startup-time network mutation that upgrades yt-dlp on every container boot.
 - [ ] **Step 2: Harden Compose defaults** with `init: true`, a health check, a temporary filesystem for `/app/temp`, and documented environment placeholders while retaining the persistent output volume.
 - [ ] **Step 3: Expand `.dockerignore`** to exclude Git metadata, docs, tests, local artifacts, and environment files from the production build context.
 - [ ] **Step 4: Update README** with security-related environment variables, public reverse-proxy guidance, testing commands, resource-limit behavior, output retention, and the container's non-root/write-path expectations.
 - [ ] **Step 5: Run final verification:** `npm test`, `npm run check`, `npm audit --audit-level=moderate`, `docker compose config` when Docker is available, a local health/request smoke test, and `git diff --check`.
-

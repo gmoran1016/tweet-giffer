@@ -108,11 +108,12 @@ function resolveJob(jobId, result) {
   job.expiresAt = Date.now() + JOB_TTL_MS;
 }
 
-function rejectJob(jobId, error) {
+function rejectJob(jobId, error = 'Tweet conversion failed. Please try again.', errorCode = 'PROCESSING_FAILED') {
   const job = jobs.get(jobId);
   if (!job) return;
   job.error = error;
-  const msg = `data: ${JSON.stringify({ type: 'error', error })}\n\n`;
+  job.errorCode = errorCode;
+  const msg = `data: ${JSON.stringify({ type: 'error', error, errorCode })}\n\n`;
   for (const client of job.clients) {
     try { client.write(msg); client.end(); } catch {}
   }
@@ -594,7 +595,33 @@ async function screenshotTweet(htmlPath) {
 
 // Composite tweet screenshot with video overlay using FFmpeg.
 // rotation is handled inline via transpose filter — no pre-encode step needed.
-function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false, rotation = 0) {
+const FFMPEG_TIMEOUT_MS = Math.max(5_000, Number(process.env.FFMPEG_TIMEOUT_MS) || 5 * 60_000);
+
+function runFfmpegCommand(command, options = {}) {
+  const { label = 'FFmpeg conversion', timeoutMs = FFMPEG_TIMEOUT_MS, onStart, onStderr, onProgress } = options;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const timer = setTimeout(() => {
+      try { command.kill('SIGKILL'); } catch {}
+      finish(reject, new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    command
+      .on('start', value => onStart && onStart(value))
+      .on('stderr', value => onStderr && onStderr(value))
+      .on('progress', value => onProgress && onProgress(value))
+      .on('error', error => finish(reject, error))
+      .on('end', () => finish(resolve));
+    try { command.run(); } catch (error) { finish(reject, error); }
+  });
+}
+
+async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false, rotation = 0) {
   const { x, y } = videoArea;
   // libx264 requires dimensions divisible by 2 — round down
   const width  = videoArea.width  % 2 === 0 ? videoArea.width  : videoArea.width  - 1;
@@ -622,8 +649,7 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
 
   let stderrLog = '';
 
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg()
+  const cmd = ffmpeg()
       .input(screenshotPath)
       .inputOptions(['-loop', '1'])
       .input(videoPath)
@@ -638,30 +664,27 @@ function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAud
       ])
       .outputOptions(outputOpts)
       .output(outputPath);
-
-    cmd
-      .on('start', command => console.log('  FFmpeg cmd:', command))
-      .on('stderr', line => { stderrLog += line + '\n'; })
-      .on('progress', p => p.percent && console.log(`  Encoding: ${Math.round(p.percent)}%`))
-      .on('error', (err) => {
-        console.error('  FFmpeg stderr:\n' + stderrLog.slice(-2000));
-        if (hasAudio) {
-          console.warn('  Retrying without audio...');
-          compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false, rotation)
-            .then(resolve).catch(reject);
-        } else {
-          reject(new Error(`FFmpeg composite failed: ${err.message}\n${stderrLog.slice(-500)}`));
-        }
-      })
-      .on('end', () => resolve(outputPath))
-      .run();
-  });
+  try {
+    await runFfmpegCommand(cmd, {
+      label: 'FFmpeg composite',
+      onStart: command => console.log('  FFmpeg cmd:', command),
+      onStderr: line => { stderrLog = (stderrLog + line + '\n').slice(-8192); },
+      onProgress: p => p.percent && console.log(`  Encoding: ${Math.round(p.percent)}%`),
+    });
+    return outputPath;
+  } catch (error) {
+    console.error('  FFmpeg stderr:\n' + stderrLog.slice(-2000));
+    if (hasAudio) {
+      console.warn('  Retrying without audio...');
+      return compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false, rotation);
+    }
+    throw new Error(`FFmpeg composite failed: ${error.message}\n${stderrLog.slice(-500)}`);
+  }
 }
 
 // Create a short video from a static screenshot (tweets without video)
-function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
+async function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) {
+  const command = ffmpeg()
       .input(screenshotPath)
       .inputOptions(['-loop', '1', '-framerate', '1'])
       .outputOptions([
@@ -673,11 +696,13 @@ function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) {
         '-crf', '18',
         '-movflags', '+faststart',
       ])
-      .output(outputPath)
-      .on('error', (err) => reject(new Error(`FFmpeg static video failed: ${err.message}`)))
-      .on('end', () => resolve(outputPath))
-      .run();
-  });
+      .output(outputPath);
+  try {
+    await runFfmpegCommand(command, { label: 'FFmpeg static video' });
+    return outputPath;
+  } catch (error) {
+    throw new Error(`FFmpeg static video failed: ${error.message}`);
+  }
 }
 
 // Convert video to GIF (palette-optimized for quality)
@@ -685,39 +710,32 @@ async function videoToGif(videoPath, gifPath, targetWidth = 598) {
   const palettePath = gifPath.replace('.gif', '_pal.png');
 
   // Pass 1: generate palette
-  await new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
+  try {
+    const paletteCommand = ffmpeg(videoPath)
       .outputOptions([
         '-vf', `fps=15,scale=${targetWidth}:-1:flags=lanczos,palettegen=max_colors=256:reserve_transparent=0`,
         '-y',
       ])
-      .output(palettePath)
-      .on('error', reject)
-      .on('end', resolve)
-      .run();
-  });
+      .output(palettePath);
+    await runFfmpegCommand(paletteCommand, { label: 'FFmpeg GIF palette' });
 
-  // Pass 2: render GIF using palette
-  await new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
+    // Pass 2: render GIF using palette
+    const gifCommand = ffmpeg(videoPath)
       .input(palettePath)
       .complexFilter([
         `[0:v]fps=15,scale=${targetWidth}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer`,
       ])
-      .output(gifPath)
-      .on('error', reject)
-      .on('end', resolve)
-      .run();
-  });
-
-  await fs.unlink(palettePath).catch(() => {});
+      .output(gifPath);
+    await runFfmpegCommand(gifCommand, { label: 'FFmpeg GIF render' });
+  } finally {
+    await fs.unlink(palettePath).catch(() => {});
+  }
   return gifPath;
 }
 
 // Convert video to WebM (VP9 + Opus — smaller than MP4, plays in all modern browsers)
-function videoToWebm(videoPath, webmPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
+async function videoToWebm(videoPath, webmPath) {
+  const command = ffmpeg(videoPath)
       .outputOptions([
         '-c:v', 'libvpx-vp9',
         '-crf', '28',
@@ -727,12 +745,12 @@ function videoToWebm(videoPath, webmPath) {
         '-deadline', 'good',
         '-cpu-used', '2',
       ])
-      .output(webmPath)
-      .on('progress', p => p.percent && console.log(`  WebM: ${Math.round(p.percent)}%`))
-      .on('error', reject)
-      .on('end', () => resolve(webmPath))
-      .run();
+      .output(webmPath);
+  await runFfmpegCommand(command, {
+    label: 'FFmpeg WebM',
+    onProgress: p => p.percent && console.log(`  WebM: ${Math.round(p.percent)}%`),
   });
+  return webmPath;
 }
 
 // ─── SSE progress endpoint (with proxy-busting headers + keepalive heartbeat) ─
@@ -757,7 +775,7 @@ app.get('/api/progress/:jobId', (req, res) => {
     return res.end();
   }
   if (job.error) {
-    res.write(`data: ${JSON.stringify({ type: 'error', error: job.error })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'error', error: job.error, errorCode: job.errorCode })}\n\n`);
     return res.end();
   }
 
@@ -782,6 +800,7 @@ app.get('/api/status/:jobId', (req, res) => {
   res.json({
     done: !!job.result,
     error: job.error || null,
+    errorCode: job.errorCode || null,
     message: job.steps.length > 0 ? job.steps[job.steps.length - 1].message : 'Starting...',
     result: job.result || null,
   });
@@ -943,14 +962,10 @@ app.post('/api/process-tweet', async (req, res) => {
         console.log('  GIF created');
       } catch (gifErr) {
         console.warn(`  GIF palette conversion failed (${gifErr.message}), trying simple conversion...`);
-        await new Promise((resolve, reject) => {
-          ffmpeg(outputVideoPath)
-            .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
-            .output(gifPath)
-            .on('error', reject)
-            .on('end', resolve)
-            .run();
-        });
+        const fallbackCommand = ffmpeg(outputVideoPath)
+          .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
+          .output(gifPath);
+        await runFfmpegCommand(fallbackCommand, { label: 'FFmpeg GIF fallback' });
         console.log('  GIF created (simple)');
       }
 
@@ -988,7 +1003,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.error('Error processing tweet:', error);
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
       await Promise.all(partialOutputs.map(file => fs.rm(file, { force: true }).catch(() => {})));
-      rejectJob(jobId, error.message || 'Failed to process tweet');
+      rejectJob(jobId);
     } finally {
       activeJobs = Math.max(0, activeJobs - 1);
     }
@@ -997,6 +1012,25 @@ app.post('/api/process-tweet', async (req, res) => {
 
 // Serve output files
 app.use('/outputs', express.static(outputDir));
+
+function resolvePublicBase(req) {
+  if (process.env.PUBLIC_BASE_URL) {
+    const configured = new URL(process.env.PUBLIC_BASE_URL);
+    if (!['http:', 'https:'].includes(configured.protocol) || configured.username || configured.password) {
+      throw new Error('Invalid PUBLIC_BASE_URL');
+    }
+    return configured.origin;
+  }
+
+  const rawHost = req.get('host');
+  const parsedHost = new URL(`http://${rawHost}`);
+  const hostname = parsedHost.hostname.toLowerCase();
+  const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  const allowed = new Set((process.env.PUBLIC_HOSTS || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
+  if (!loopback && !allowed.has(hostname) && !allowed.has(parsedHost.host.toLowerCase())) return null;
+
+  return `${req.protocol === 'https' ? 'https' : 'http'}://${parsedHost.host}`;
+}
 
 // Share embed page — returns OG-tagged HTML so Discord/Slack/etc embed properly with audio
 // Usage: /share/:videoId?f=video  (f = gif | video | webm, defaults to video)
@@ -1024,13 +1058,11 @@ app.get('/share/:videoId', async (req, res) => {
 
   let base;
   try {
-    const candidate = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-    const parsedBase = new URL(candidate);
-    if (!['http:', 'https:'].includes(parsedBase.protocol) || parsedBase.username || parsedBase.password) throw new Error();
-    base = parsedBase.origin;
+    base = resolvePublicBase(req);
   } catch {
-    return res.status(400).send('Invalid request origin');
+    return res.status(500).send('Share origin configuration is invalid');
   }
+  if (!base) return res.status(503).send('Share origin is not configured');
   const mp4Url  = `${base}/outputs/${videoId}.mp4`;
   const gifUrl  = `${base}/outputs/${videoId}.gif`;
   const webmUrl = `${base}/outputs/${videoId}.webm`;
@@ -1174,4 +1206,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { app, startServer, stopServer };
+module.exports = { app, startServer, stopServer, _internals: { runFfmpegCommand } };

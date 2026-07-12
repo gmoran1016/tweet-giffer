@@ -85,7 +85,7 @@ test('escapes share metadata and safely falls back from unsupported formats', as
   assert.match(html, /<noscript>/);
 });
 
-test('share URLs do not reflect hostile host or forwarded headers', async () => {
+test('share rejects hostile host and forwarded headers without trusted origin config', async () => {
   const id = '223e4567-e89b-42d3-a456-426614174000';
   await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
   const response = await requestWithHeaders(`/share/${id}`, {
@@ -93,9 +93,29 @@ test('share URLs do not reflect hostile host or forwarded headers', async () => 
     'x-forwarded-host': 'forwarded.evil.example',
     'x-forwarded-proto': 'https',
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 503);
   assert.doesNotMatch(response.body, /evil\.example/);
-  assert.match(response.body, /http:\/\/localhost:/);
+  assert.match(response.body, /Share origin is not configured/);
+});
+
+test('share accepts explicitly trusted hosts and configured canonical origins', async () => {
+  const id = '423e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
+  process.env.PUBLIC_HOSTS = 'trusted.example';
+  try {
+    let response = await requestWithHeaders(`/share/${id}`, { host: 'trusted.example' });
+    assert.equal(response.status, 200);
+    assert.match(response.body, /http:\/\/trusted\.example\/outputs/);
+
+    process.env.PUBLIC_BASE_URL = 'https://cdn.example.test/base-ignored';
+    response = await requestWithHeaders(`/share/${id}`, { host: 'evil.example' });
+    assert.equal(response.status, 200);
+    assert.match(response.body, /https:\/\/cdn\.example\.test\/outputs/);
+    assert.doesNotMatch(response.body, /evil\.example/);
+  } finally {
+    delete process.env.PUBLIC_HOSTS;
+    delete process.env.PUBLIC_BASE_URL;
+  }
 });
 
 test('share fallback selects an existing WebM-only output', async () => {
@@ -132,7 +152,7 @@ test('capacity rejects concurrent work and setup failure releases the slot', asy
     const { jobId } = await first.json();
     await setupStarted;
     assert.equal((await submit('https://x.com/alice/status/1002')).status, 503);
-    rejectSetup(new Error('forced setup failure'));
+    rejectSetup(new Error('forced setup failure C:\\secret\\temp\\session stderr=private'));
 
     let status;
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -140,7 +160,9 @@ test('capacity rejects concurrent work and setup failure releases the slot', asy
       if (status.error) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.match(status.error, /forced setup failure/);
+    assert.equal(status.error, 'Tweet conversion failed. Please try again.');
+    assert.equal(status.errorCode, 'PROCESSING_FAILED');
+    assert.doesNotMatch(JSON.stringify(status), /secret|stderr|session/i);
 
     fs.mkdir = async target => {
       if (path.dirname(target) === process.env.TEMP_DIR) throw new Error('second setup failure');
@@ -155,7 +177,8 @@ test('capacity rejects concurrent work and setup failure releases the slot', asy
       if (thirdStatus.error) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.match(thirdStatus.error, /second setup failure/);
+    assert.equal(thirdStatus.error, 'Tweet conversion failed. Please try again.');
+    assert.equal(thirdStatus.errorCode, 'PROCESSING_FAILED');
   } finally {
     fs.mkdir = originalMkdir;
     console.error = originalConsoleError;

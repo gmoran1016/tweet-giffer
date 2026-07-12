@@ -3,8 +3,9 @@ services:
     build: .
     init: true
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:${PORT:-3000}"
     environment:
+      PORT: ${PORT:-3000}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       TRUST_PROXY: ${TRUST_PROXY:-false}
       ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
@@ -17,7 +18,7 @@ services:
     restart: unless-stopped
     shm_size: 256mb   # Chromium needs extra shared memory
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:$${PORT:-3000}/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 5s
       start_period: 20s
