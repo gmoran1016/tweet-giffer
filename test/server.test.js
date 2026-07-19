@@ -193,6 +193,14 @@ test('health responses use defensive and non-cache headers', async () => {
   assert.equal(response.headers.get('cache-control'), 'no-store');
 });
 
+test('distinguishes tweets without video from yt-dlp failures', () => {
+  const { isNoVideoDownloadError } = require('../server')._internals;
+
+  assert.equal(isNoVideoDownloadError(new Error('ERROR: [Twitter] 123: No video formats found!')), true);
+  assert.equal(isNoVideoDownloadError(new Error('yt-dlp is not installed. Run: pip install yt-dlp')), false);
+  assert.equal(isNoVideoDownloadError(new Error('yt-dlp failed (code 1): HTTP Error 403: Forbidden')), false);
+});
+
 test('stopServer closes active SSE clients and settles promptly', async () => {
   const api = require('../server');
   const originalMkdir = fs.mkdir;
