@@ -120,6 +120,7 @@ Key dependencies: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Puppeteer](https:
 | `OUTPUT_DIR` | `./outputs` | Generated output directory; must be writable. |
 | `TEMP_DIR` | `./temp` | Temporary work directory; must be writable and may be ephemeral. |
 | `FFMPEG_TIMEOUT_MS` | `300000` | Maximum time for each FFmpeg pass before it is killed (minimum 5000 ms). |
+| `YTDLP_UPDATE` | `true` | Docker only: refresh yt-dlp on container start so Twitter/X extraction keeps working. Set to `false` on air-gapped hosts. |
 
 `MAX_CONCURRENT_JOBS` is a per-process limit, not a queue: excess work is rejected with HTTP 503 and may be retried later. Conversion is CPU-, memory-, and temporary-disk-intensive; start with the default concurrency and size `/dev/shm` and `/app/temp` for the largest expected videos.
 

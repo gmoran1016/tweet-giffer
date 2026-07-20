@@ -254,6 +254,11 @@ function extractTweetText(oembedHtml) {
   return p.text().trim();
 }
 
+function isNoVideoDownloadError(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /\bno (?:video|media) formats? found\b|\bno video found\b/i.test(message);
+}
+
 // Download video using yt-dlp
 async function downloadVideoYtDlp(tweetUrl, sessionDir) {
   if (!YT_DLP) throw new Error('yt-dlp is not installed. Run: pip install yt-dlp');
@@ -881,6 +886,7 @@ app.post('/api/process-tweet', async (req, res) => {
         console.log(`  Video: ${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s, audio=${videoInfo.hasAudio}`);
       } catch (err) {
         console.warn(`  Video download failed: ${err.message}`);
+        if (!isNoVideoDownloadError(err)) throw err;
         emitProgress(jobId, { type: 'step', message: 'No video found, rendering image card...' });
       }
 
@@ -1206,4 +1212,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { app, startServer, stopServer, _internals: { runFfmpegCommand } };
+module.exports = { app, startServer, stopServer, _internals: { runFfmpegCommand, isNoVideoDownloadError } };

@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     ca-certificates \
+    gosu \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
@@ -45,13 +46,17 @@ COPY . .
 
 # Only generated output and temporary work files are writable at runtime.
 RUN mkdir -p outputs temp \
-    && chown node:node outputs temp
+    && chown node:node outputs temp \
+    && chmod +x docker-entrypoint.sh
 
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:${PORT:-3000}/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-USER node
+# Runs as root only long enough to refresh yt-dlp, then drops to the unprivileged
+# node user via gosu (see docker-entrypoint.sh). If started with --user, it stays
+# unprivileged and skips the update.
+ENTRYPOINT ["./docker-entrypoint.sh"]
 
 CMD ["node", "server.js"]
