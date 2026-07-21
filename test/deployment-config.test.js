@@ -15,3 +15,11 @@ test('Compose health check preserves container-shell PORT expansion', () => {
   assert.match(compose, /127\.0\.0\.1:\$\$\{PORT:-3000\}\/api\/health/);
   assert.match(compose, /PORT: \$\{PORT:-3000\}/);
 });
+
+test('Docker image advertises the stable Unraid icon URL', () => {
+  const dockerfile = fs.readFileSync(path.join(root, 'Dockerfile'), 'utf8');
+  assert.match(
+    dockerfile,
+    /LABEL net\.unraid\.docker\.icon="https:\/\/raw\.githubusercontent\.com\/gmoran1016\/tweet-giffer\/master\/public\/docker-icon\.png"/
+  );
+});

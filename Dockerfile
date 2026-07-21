@@ -37,6 +37,8 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/gmoran1016/tweet-giffer/master/public/docker-icon.png"
+
 # Install Node dependencies
 COPY package*.json ./
 RUN npm ci --omit=dev
