@@ -6,3 +6,4 @@ temp/
 *.mp4
 *.gif
 *.webm
+.worktrees/
