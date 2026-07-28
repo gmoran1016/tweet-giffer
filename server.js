@@ -591,7 +591,7 @@ async function screenshotTweet(htmlPath) {
     });
 
     await page.close();
-    return { screenshotPath, videoArea, cardWidth: Math.round(cardBox.width) };
+    return { screenshotPath, videoArea, cardWidth: Math.round(cardBox.width), cardHeight: Math.round(cardBox.height) };
   } catch (err) {
     await page.close().catch(() => {});
     throw err;
@@ -941,7 +941,7 @@ app.post('/api/process-tweet', async (req, res) => {
       const htmlPath = path.join(sessionDir, 'tweet.html');
       await fs.writeFile(htmlPath, htmlContent, 'utf8');
 
-      const { screenshotPath, videoArea } = await screenshotTweet(htmlPath);
+      const { screenshotPath, videoArea, cardHeight: outputHeight } = await screenshotTweet(htmlPath);
       console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
 
       // 7. Composite video (rotation applied inline — no pre-encode pass)
@@ -992,7 +992,7 @@ app.post('/api/process-tweet', async (req, res) => {
 
       // Save metadata so the share page can link back to the original tweet
       const metaPath = path.join(outputDir, `${videoId}.json`);
-      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: canonicalUrl, authorName }), 'utf8').catch(() => {});
+      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: canonicalUrl, authorName, width: cardWidth, height: outputHeight }), 'utf8').catch(() => {});
 
       // Store in cache
       tweetCache.set(tweetId, videoId);
@@ -1057,9 +1057,14 @@ app.get('/share/:videoId', async (req, res) => {
   // Load stored metadata (tweet URL + author) if available
   let tweetUrl = null;
   let authorName = null;
+  let outputWidth = 598;
+  let outputHeight = 336;
   try {
     const raw = await fs.readFile(path.join(outputDir, `${videoId}.json`), 'utf8');
-    ({ tweetUrl, authorName } = JSON.parse(raw));
+    const meta = JSON.parse(raw);
+    ({ tweetUrl, authorName } = meta);
+    if (Number.isInteger(meta.width) && meta.width > 0) outputWidth = meta.width;
+    if (Number.isInteger(meta.height) && meta.height > 0) outputHeight = meta.height;
   } catch {}
 
   let base;
@@ -1087,46 +1092,71 @@ app.get('/share/:videoId', async (req, res) => {
   }
 
   const isVideo = mimeType.startsWith('video/');
+  const actualFormat = mimeType === 'video/webm' ? 'webm' : (mimeType === 'image/gif' ? 'gif' : 'video');
+  const shareUrl = `${base}/share/${videoId}?f=${actualFormat}`;
   const thumbUrl = gifExists ? gifUrl : (mp4Exists ? mp4Url : null);
   const ogTitle = escapeHtml(authorName ? `Tweet by ${authorName}` : 'Tweet Video');
+  const ogDescription = 'Shareable tweet video with audio';
+  const safeShareUrl = escapeHtml(shareUrl);
   const safeFileUrl = escapeHtml(fileUrl);
   const safeThumbUrl = thumbUrl ? escapeHtml(thumbUrl) : null;
   const safeTweetUrl = tweetUrl && parseTweetUrl(tweetUrl) ? escapeHtml(parseTweetUrl(tweetUrl).canonicalUrl) : null;
   const safeMimeType = escapeHtml(mimeType);
+  const safeDescription = escapeHtml(ogDescription);
+  const safeWidth = escapeHtml(outputWidth);
+  const safeHeight = escapeHtml(outputHeight);
+  const twitterCard = isVideo ? 'player' : 'summary_large_image';
 
   const html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <title>${ogTitle}</title>
+  <link rel="canonical" href="${safeShareUrl}" />
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
   <meta property="og:title" content="${ogTitle}" />
+  <meta property="og:description" content="${safeDescription}" />
+  <meta property="og:url" content="${safeShareUrl}" />
   ${safeThumbUrl ? `<meta property="og:image" content="${safeThumbUrl}" />` : ''}
-  ${safeTweetUrl ? `<meta property="og:url" content="${safeTweetUrl}" />` : ''}
+  ${safeThumbUrl ? `<meta property="og:image:width" content="${safeWidth}" />` : ''}
+  ${safeThumbUrl ? `<meta property="og:image:height" content="${safeHeight}" />` : ''}
+  <meta name="twitter:card" content="${twitterCard}" />
+  <meta name="twitter:title" content="${ogTitle}" />
+  <meta name="twitter:description" content="${safeDescription}" />
+  ${safeThumbUrl ? `<meta name="twitter:image" content="${safeThumbUrl}" />` : ''}
   ${isVideo ? `
   <meta property="og:video" content="${safeFileUrl}" />
   <meta property="og:video:url" content="${safeFileUrl}" />
   <meta property="og:video:secure_url" content="${safeFileUrl}" />
   <meta property="og:video:type" content="${safeMimeType}" />
-  <meta property="og:video:width" content="598" />
+  <meta property="og:video:width" content="${safeWidth}" />
+  <meta property="og:video:height" content="${safeHeight}" />
+  <meta name="twitter:player" content="${safeShareUrl}" />
+  <meta name="twitter:player:width" content="${safeWidth}" />
+  <meta name="twitter:player:height" content="${safeHeight}" />
+  <meta name="twitter:player:stream" content="${safeFileUrl}" />
+  <meta name="twitter:player:stream:content_type" content="${safeMimeType}" />
   ${mp4Exists && mimeType !== 'video/mp4' ? `
   <meta property="og:video" content="${mp4Url}" />
   <meta property="og:video:url" content="${mp4Url}" />
   <meta property="og:video:secure_url" content="${mp4Url}" />
   <meta property="og:video:type" content="video/mp4" />
-  <meta property="og:video:width" content="598" />` : ''}
+  <meta property="og:video:width" content="${safeWidth}" />
+  <meta property="og:video:height" content="${safeHeight}" />` : ''}
   ` : ''}
 </head>
 <body>
-  <script>window.location.replace(${JSON.stringify(fileUrl).replaceAll('<', '\\u003c')});</script>
-  <noscript><meta http-equiv="refresh" content="0;url=${safeFileUrl}"></noscript>
-  <p>Redirecting… <a href="${safeFileUrl}">Click here if not redirected</a></p>
+  ${isVideo
+    ? `<video src="${safeFileUrl}" ${safeThumbUrl ? `poster="${safeThumbUrl}" ` : ''}controls playsinline style="max-width:100%;height:auto"></video>`
+    : `<img src="${safeFileUrl}" alt="${ogTitle}" style="max-width:100%;height:auto" />`}
+  <p><a href="${safeFileUrl}">Open media file</a></p>
   ${safeTweetUrl ? `<p><a href="${safeTweetUrl}">View original tweet</a></p>` : ''}
 </body>
 </html>`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+  res.removeHeader('X-Frame-Options');
+  res.setHeader('Content-Security-Policy', `default-src 'none'; media-src ${base}; img-src ${base}; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors https://discord.com https://*.discord.com`);
   res.send(html);
 });
 

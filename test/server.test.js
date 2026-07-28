@@ -82,7 +82,7 @@ test('escapes share metadata and safely falls back from unsupported formats', as
   assert.ok(response.headers.get('content-security-policy'));
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
   assert.match(html, /123e4567-e89b-42d3-a456-426614174000\.mp4/);
-  assert.match(html, /<noscript>/);
+  assert.match(html, /<video /);
 });
 
 test('share rejects hostile host and forwarded headers without trusted origin config', async () => {
@@ -114,6 +114,36 @@ test('share accepts explicitly trusted hosts and configured canonical origins', 
     assert.doesNotMatch(response.body, /evil\.example/);
   } finally {
     delete process.env.PUBLIC_HOSTS;
+    delete process.env.PUBLIC_BASE_URL;
+  }
+});
+
+test('share emits Discord-friendly canonical video metadata', async () => {
+  const id = '523e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.gif`), 'image');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.json`), JSON.stringify({
+    authorName: 'Alice',
+    tweetUrl: 'https://x.com/alice/status/12345',
+    width: 598,
+    height: 736,
+  }));
+  process.env.PUBLIC_BASE_URL = 'https://giffer.example.test';
+  try {
+    const response = await fetch(`${base}/share/${id}?f=video`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-frame-options'), null);
+    assert.match(response.headers.get('content-security-policy'), /frame-ancestors https:\/\/discord\.com https:\/\/\*\.discord\.com/);
+    assert.match(html, new RegExp(`<meta property="og:url" content="https://giffer\\.example\\.test/share/${id}\\?f=video" />`));
+    assert.match(html, /<meta property="og:description" content="Shareable tweet video with audio" \/>/);
+    assert.match(html, /<meta property="og:video:height" content="736" \/>/);
+    assert.match(html, /<meta name="twitter:card" content="player" \/>/);
+    assert.match(html, new RegExp(`<meta name="twitter:player" content="https://giffer\\.example\\.test/share/${id}\\?f=video" />`));
+    assert.match(html, new RegExp(`<meta name="twitter:player:stream" content="https://giffer\\.example\\.test/outputs/${id}\\.mp4" />`));
+    assert.match(html, new RegExp(`<link rel="canonical" href="https://giffer\\.example\\.test/share/${id}\\?f=video" />`));
+    assert.doesNotMatch(html, /<meta property="og:url" content="https:\/\/x\.com/);
+  } finally {
     delete process.env.PUBLIC_BASE_URL;
   }
 });
