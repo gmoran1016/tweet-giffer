@@ -339,6 +339,30 @@ function extractQuoteContext(oembedHtml) {
   };
 }
 
+function hasQuoteMarkup(oembedHtml) {
+  if (typeof oembedHtml !== 'string' || !oembedHtml.trim()) return false;
+  const $ = cheerio.load(oembedHtml);
+  return $('blockquote.twitter-tweet').length > 1;
+}
+
+function buildResultMetadata({ authorName, staticCard, quoteContext }) {
+  return {
+    authorName: typeof authorName === 'string' && authorName.trim() ? authorName.trim() : null,
+    staticCard: staticCard === true,
+    quoteContext: quoteContext && typeof quoteContext === 'object' ? quoteContext : null,
+  };
+}
+
+async function readOutputMetadata(videoId) {
+  try {
+    const raw = await fs.readFile(path.join(outputDir, `${videoId}.json`), 'utf8');
+    const metadata = JSON.parse(raw);
+    return buildResultMetadata(metadata);
+  } catch {
+    return buildResultMetadata({});
+  }
+}
+
 function isNoVideoDownloadError(error) {
   const message = error instanceof Error ? error.message : String(error || '');
   return /\bno (?:video|media) formats? found\b|\bno video found\b/i.test(message);
@@ -479,7 +503,10 @@ async function downloadFile(url, filePath) {
 }
 
 // Render the tweet as HTML for screenshotting
-function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHtml, cardWidth = 598, tweetDate = null }) {
+function renderTweetHtml({
+  authorName, handle, tweetText, avatarFileUrl, mediaHtml, cardWidth = 598,
+  tweetDate = null, quoteContext = null, quoteContextUnavailable = false,
+}) {
   const esc = s => String(s || '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m]));
 
   const avatarContent = avatarFileUrl
@@ -489,6 +516,18 @@ function renderTweetHtml({ authorName, handle, tweetText, avatarFileUrl, mediaHt
   const dateStr = tweetDate instanceof Date && !isNaN(tweetDate)
     ? tweetDate.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' })
     : new Date().toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric', year: 'numeric' });
+
+  const safeQuoteUrl = quoteContext && parseTweetUrl(quoteContext.tweetUrl)
+    ? parseTweetUrl(quoteContext.tweetUrl).canonicalUrl
+    : null;
+  const quoteHtml = quoteContext
+    ? `<div class="quoted-post">
+        <div class="quoted-label">Quoted post</div>
+        <div class="quoted-author">${esc(quoteContext.authorName)} <span>@${esc(quoteContext.handle)}</span></div>
+        <div class="quoted-text">${esc(quoteContext.text)}</div>
+        ${safeQuoteUrl ? `<a class="quoted-link" href="${esc(safeQuoteUrl)}">View quoted post</a>` : ''}
+      </div>`
+    : (quoteContextUnavailable ? '<div class="quoted-post quote-unavailable"><div class="quoted-label">Quoted post content unavailable</div></div>' : '');
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -561,6 +600,18 @@ body {
   white-space: pre-wrap;
   word-wrap: break-word;
 }
+.quoted-post {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #cfd9de;
+  border-radius: 12px;
+  color: #0f1419;
+}
+.quoted-label { font-size: 12px; font-weight: 700; color: #536471; margin-bottom: 4px; }
+.quoted-author { font-weight: 700; font-size: 14px; }
+.quoted-author span { color: #536471; font-weight: 400; }
+.quoted-text { margin-top: 4px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; word-wrap: break-word; }
+.quoted-link { display: inline-block; margin-top: 6px; color: #0b6ca8; font-size: 13px; }
 .media-wrap {
   margin-top: 12px;
   border-radius: 12px;
@@ -620,6 +671,7 @@ body {
   </div>
   <div class="tweet-body">
     <div class="tweet-text">${esc(tweetText || '')}</div>
+    ${quoteHtml}
     ${mediaHtml}
   </div>
   <div class="tweet-footer">
@@ -939,6 +991,7 @@ app.post('/api/process-tweet', async (req, res) => {
     if (fsSync.existsSync(mp4) && fsSync.existsSync(gif)) {
       console.log(`Cache hit for tweet ${tweetId} → ${cachedVideoId}`);
       const webmPath = path.join(outputDir, `${cachedVideoId}.webm`);
+      const cachedMetadata = await readOutputMetadata(cachedVideoId);
       return res.json({
         success: true,
         cached: true,
@@ -946,6 +999,7 @@ app.post('/api/process-tweet', async (req, res) => {
         gif: `/outputs/${cachedVideoId}.gif`,
         webm: fsSync.existsSync(webmPath) ? `/outputs/${cachedVideoId}.webm` : null,
         videoId: cachedVideoId,
+        ...cachedMetadata,
       });
     }
     tweetCache.delete(tweetId); // stale entry
@@ -980,6 +1034,8 @@ app.post('/api/process-tweet', async (req, res) => {
       const oembedData = await fetchOEmbed(canonicalUrl);
       const tweetText = extractTweetText(oembedData.html);
       const authorName = oembedData.author_name || username;
+      const quoteContext = extractQuoteContext(oembedData.html);
+      const quoteContextUnavailable = hasQuoteMarkup(oembedData.html) && !quoteContext;
       const tweetDate = tweetDateFromId(tweetId);
       console.log(`  Author: ${authorName}`);
       console.log(`  Tweet date: ${tweetDate ? tweetDate.toISOString() : 'unknown'}`);
@@ -1048,7 +1104,10 @@ app.post('/api/process-tweet', async (req, res) => {
       // 6. Render tweet HTML and screenshot (uses warm browser pool)
       processingPhase = 'render';
       emitProgress(jobId, { type: 'step', message: 'Rendering tweet card...' });
-      const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml, cardWidth, tweetDate });
+      const htmlContent = renderTweetHtml({
+        authorName, handle: username, tweetText, avatarFileUrl, mediaHtml,
+        cardWidth, tweetDate, quoteContext, quoteContextUnavailable,
+      });
       const htmlPath = path.join(sessionDir, 'tweet.html');
       await fs.writeFile(htmlPath, htmlContent, 'utf8');
 
@@ -1106,7 +1165,11 @@ app.post('/api/process-tweet', async (req, res) => {
 
       // Save metadata so the share page can link back to the original tweet
       const metaPath = path.join(outputDir, `${videoId}.json`);
-      await fs.writeFile(metaPath, JSON.stringify({ tweetUrl: canonicalUrl, authorName, width: cardWidth, height: outputHeight }), 'utf8').catch(() => {});
+      const staticCard = !(videoPath && videoInfo);
+      const resultMetadata = buildResultMetadata({ authorName, staticCard, quoteContext });
+      await fs.writeFile(metaPath, JSON.stringify({
+        tweetUrl: canonicalUrl, width: cardWidth, height: outputHeight, ...resultMetadata,
+      }), 'utf8').catch(() => {});
 
       // Store in cache
       tweetCache.set(tweetId, videoId);
@@ -1117,6 +1180,7 @@ app.post('/api/process-tweet', async (req, res) => {
         gif: `/outputs/${videoId}.gif`,
         webm: fsSync.existsSync(webmPath) ? `/outputs/${videoId}.webm` : null,
         videoId,
+        ...resultMetadata,
       });
 
     } catch (error) {
@@ -1369,5 +1433,8 @@ module.exports = {
     emitProgress,
     classifyProcessingError,
     extractQuoteContext,
+    buildResultMetadata,
+    renderTweetHtml,
+    tweetCache,
   },
 };

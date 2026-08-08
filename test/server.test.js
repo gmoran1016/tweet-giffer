@@ -85,6 +85,81 @@ test('normalizes job progress to the six conversion stages', () => {
   assert.ok(step.elapsedMs >= 0);
 });
 
+test('builds safe result metadata for video and static-card outputs', () => {
+  const { buildResultMetadata } = require('../server')._internals;
+  assert.deepEqual(buildResultMetadata({ authorName: 'Alice', staticCard: true, quoteContext: null }), {
+    authorName: 'Alice',
+    staticCard: true,
+    quoteContext: null,
+  });
+  assert.deepEqual(buildResultMetadata({
+    authorName: 'Outer',
+    staticCard: false,
+    quoteContext: {
+      authorName: 'Quoted',
+      handle: 'quoted',
+      tweetUrl: 'https://x.com/quoted/status/2',
+      text: 'Quoted text',
+    },
+  }), {
+    authorName: 'Outer',
+    staticCard: false,
+    quoteContext: {
+      authorName: 'Quoted',
+      handle: 'quoted',
+      tweetUrl: 'https://x.com/quoted/status/2',
+      text: 'Quoted text',
+    },
+  });
+});
+
+test('renders escaped quote context in a visually distinct card block', () => {
+  const { renderTweetHtml } = require('../server')._internals;
+  const html = renderTweetHtml({
+    authorName: 'Outer',
+    handle: 'outer',
+    tweetText: 'Outer text',
+    mediaHtml: '',
+    quoteContext: {
+      authorName: '<Quoted>',
+      handle: 'quoted',
+      tweetUrl: 'https://x.com/quoted/status/2',
+      text: '<Quoted text>',
+    },
+  });
+  assert.match(html, /class="quoted-post"/);
+  assert.match(html, /&lt;Quoted&gt;/);
+  assert.match(html, /&lt;Quoted text&gt;/);
+  assert.doesNotMatch(html, /<Quoted>/);
+});
+
+test('cache responses include sidecar metadata and cached state', async () => {
+  const { tweetCache } = require('../server')._internals;
+  const tweetId = '987654321';
+  const videoId = '723e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${videoId}.mp4`), 'media');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${videoId}.gif`), 'image');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${videoId}.json`), JSON.stringify({
+    authorName: 'Alice', staticCard: true, quoteContext: null,
+  }));
+  tweetCache.set(tweetId, videoId);
+  try {
+    const response = await fetch(`${base}/api/process-tweet`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: `https://x.com/alice/status/${tweetId}` }),
+    });
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(data.cached, true);
+    assert.equal(data.staticCard, true);
+    assert.equal(data.authorName, 'Alice');
+    assert.equal(data.quoteContext, null);
+  } finally {
+    tweetCache.delete(tweetId);
+  }
+});
+
 function requestWithHeaders(pathname, headers) {
   return new Promise((resolve, reject) => {
     const request = http.get(`${base}${pathname}`, { headers }, response => {
