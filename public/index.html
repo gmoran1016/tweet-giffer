@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tweet Giffer - Convert Tweets to GIFs/Videos</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -32,11 +33,14 @@
 
       <section id="loadingSection" class="loading-section hidden" role="status" aria-live="polite" aria-atomic="true">
         <div class="spinner" aria-hidden="true"></div>
-        <p id="loadingStatus">Processing tweet... This may take a moment.</p>
+        <p id="loadingStatus">Starting conversion...</p>
+        <p id="loadingElapsed" class="loading-elapsed" aria-hidden="true"></p>
       </section>
 
       <section id="resultSection" class="result-section hidden" aria-labelledby="resultHeading" tabindex="-1">
         <h2 id="resultHeading">Your tweet is ready!</h2>
+        <p id="resultSummary" class="result-summary"></p>
+        <p id="cacheNotice" class="cache-notice hidden" role="status" aria-live="polite"></p>
         <div class="preview-container">
           <div class="preview-tabs" role="tablist" aria-label="Preview format">
             <button type="button" id="gifTab" class="tab-btn active" role="tab" data-tab="gif" aria-selected="true" aria-controls="gifPreview" tabindex="0">GIF</button>
@@ -71,7 +75,9 @@
       </section>
 
       <section id="errorSection" class="error-section hidden" role="alert" aria-atomic="true" tabindex="-1">
+        <h2 id="errorHeading">Conversion could not be completed</h2>
         <p id="errorMessage"></p>
+        <button type="button" id="retryBtn" class="btn-secondary hidden">Try again</button>
       </section>
     </main>
 

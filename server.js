@@ -1236,12 +1236,14 @@ app.get('/share/:videoId', async (req, res) => {
   // Load stored metadata (tweet URL + author) if available
   let tweetUrl = null;
   let authorName = null;
+  let staticCard = false;
   let outputWidth = 598;
   let outputHeight = 336;
   try {
     const raw = await fs.readFile(path.join(outputDir, `${videoId}.json`), 'utf8');
     const meta = JSON.parse(raw);
     ({ tweetUrl, authorName } = meta);
+    staticCard = meta.staticCard === true;
     if (Number.isInteger(meta.width) && meta.width > 0) outputWidth = meta.width;
     if (Number.isInteger(meta.height) && meta.height > 0) outputHeight = meta.height;
   } catch {}
@@ -1258,7 +1260,9 @@ app.get('/share/:videoId', async (req, res) => {
   const webmUrl = `${base}/outputs/${videoId}.webm`;
 
   let fileUrl, mimeType;
-  if (format === 'webm' && webmExists) {
+  if (staticCard && gifExists) {
+    fileUrl = gifUrl; mimeType = 'image/gif';
+  } else if (format === 'webm' && webmExists) {
     fileUrl = webmUrl; mimeType = 'video/webm';
   } else if (format === 'gif' && gifExists) {
     fileUrl = gifUrl; mimeType = 'image/gif';
@@ -1270,12 +1274,12 @@ app.get('/share/:videoId', async (req, res) => {
     fileUrl = webmUrl; mimeType = 'video/webm';
   }
 
-  const isVideo = mimeType.startsWith('video/');
+  const isVideo = !staticCard && mimeType.startsWith('video/');
   const actualFormat = mimeType === 'video/webm' ? 'webm' : (mimeType === 'image/gif' ? 'gif' : 'video');
   const shareUrl = `${base}/share/${videoId}?f=${actualFormat}`;
-  const thumbUrl = gifExists ? gifUrl : (mp4Exists ? mp4Url : null);
+  const thumbUrl = gifExists ? gifUrl : (isVideo && mp4Exists ? mp4Url : null);
   const ogTitle = escapeHtml(authorName ? `Tweet by ${authorName}` : 'Tweet Video');
-  const ogDescription = 'Shareable tweet video with audio';
+  const ogDescription = staticCard ? 'Shareable tweet card' : 'Shareable tweet video with audio';
   const safeShareUrl = escapeHtml(shareUrl);
   const safeFileUrl = escapeHtml(fileUrl);
   const safeThumbUrl = thumbUrl ? escapeHtml(thumbUrl) : null;
@@ -1315,13 +1319,6 @@ app.get('/share/:videoId', async (req, res) => {
   <meta name="twitter:player:height" content="${safeHeight}" />
   <meta name="twitter:player:stream" content="${safeFileUrl}" />
   <meta name="twitter:player:stream:content_type" content="${safeMimeType}" />
-  ${mp4Exists && mimeType !== 'video/mp4' ? `
-  <meta property="og:video" content="${mp4Url}" />
-  <meta property="og:video:url" content="${mp4Url}" />
-  <meta property="og:video:secure_url" content="${mp4Url}" />
-  <meta property="og:video:type" content="video/mp4" />
-  <meta property="og:video:width" content="${safeWidth}" />
-  <meta property="og:video:height" content="${safeHeight}" />` : ''}
   ` : ''}
 </head>
 <body>

@@ -1,3 +1,9 @@
+:root {
+  --accent: #0b6ca8;
+  --accent-hover: #084c73;
+  --accent-soft: #e8f2f8;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -49,7 +55,7 @@ header {
 
 header h1 {
   font-size: 2.5rem;
-  color: #1da1f2;
+  color: var(--accent);
   margin-bottom: 10px;
 }
 
@@ -79,14 +85,14 @@ header h1 {
 }
 
 #tweetUrl:focus {
-  border-color: #1da1f2;
+  border-color: var(--accent);
 }
 
 :focus-visible { outline: 3px solid #0b6ca8; outline-offset: 3px; }
 
 .btn-primary {
   padding: 15px 30px;
-  background: #1da1f2;
+  background: var(--accent);
   color: white;
   border: none;
   border-radius: 10px;
@@ -98,9 +104,9 @@ header h1 {
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: #1a91da;
+  background: var(--accent-hover);
   transform: translateY(-2px);
-  box-shadow: 0 5px 15px rgba(29, 161, 242, 0.4);
+  box-shadow: 0 5px 15px rgba(11, 108, 168, 0.35);
 }
 
 .btn-primary:disabled {
@@ -111,8 +117,8 @@ header h1 {
 .btn-secondary {
   padding: 12px 24px;
   background: white;
-  color: #1da1f2;
-  border: 2px solid #1da1f2;
+  color: var(--accent);
+  border: 2px solid var(--accent);
   border-radius: 8px;
   font-size: 0.9rem;
   font-weight: 600;
@@ -121,7 +127,7 @@ header h1 {
 }
 
 .btn-secondary:hover {
-  background: #1da1f2;
+  background: var(--accent-hover);
   color: white;
 }
 
@@ -138,7 +144,7 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   width: 50px;
   height: 50px;
   border: 4px solid #e1e8ed;
-  border-top-color: #1da1f2;
+  border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 1s linear infinite;
   margin: 0 auto 20px;
@@ -148,6 +154,10 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   to {
     transform: rotate(360deg);
   }
+}
+
+.result-section, .error-section {
+  scroll-margin-top: 1rem;
 }
 
 .result-section {
@@ -160,6 +170,25 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   margin-bottom: 30px;
   font-size: 1.8rem;
 }
+
+.result-summary, .cache-notice, .loading-elapsed {
+  text-align: center;
+  color: #526574;
+}
+
+.result-summary { margin: -18px 0 10px; }
+.cache-notice {
+  margin: 0 auto 18px;
+  padding: 8px 12px;
+  width: fit-content;
+  background: var(--accent-soft);
+  color: #174a68;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.loading-elapsed { min-height: 1.25em; margin-top: 8px; font-size: 0.9rem; }
 
 .preview-container {
   background: #f7f9fa;
@@ -233,7 +262,7 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
 
 .share-group {
   display: flex;
-  border: 2px solid #1da1f2;
+  border: 2px solid var(--accent);
   border-radius: 8px;
   overflow: hidden;
 }
@@ -241,10 +270,10 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
 .share-select {
   padding: 10px 12px;
   border: none;
-  border-right: 2px solid #1da1f2;
+  border-right: 2px solid var(--accent);
   font-size: 0.9rem;
   font-weight: 600;
-  color: #1da1f2;
+  color: var(--accent);
   background: white;
   cursor: pointer;
   outline: none;
@@ -273,6 +302,9 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   color: #8b1010;
   text-align: center;
 }
+
+.error-section h2 { margin-bottom: 8px; font-size: 1.2rem; }
+.error-section .btn-secondary { margin-top: 14px; }
 
 .hidden {
   display: none;
