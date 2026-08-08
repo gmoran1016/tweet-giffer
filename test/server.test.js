@@ -21,6 +21,70 @@ test.before(async () => {
   base = `http://127.0.0.1:${server.address().port}`;
 });
 
+test('classifies upstream access failures without exposing diagnostics', () => {
+  const { classifyProcessingError } = require('../server')._internals;
+  assert.deepEqual(
+    classifyProcessingError({ response: { status: 404 } }, 'oembed'),
+    {
+      errorCode: 'TWEET_UNAVAILABLE',
+      message: 'This post is unavailable, private, or no longer exists. Check the URL and try another public post.',
+      status: 502,
+    },
+  );
+  assert.deepEqual(
+    classifyProcessingError(new Error('stderr=C:\\secret\\video'), 'video'),
+    {
+      errorCode: 'MEDIA_ACCESS_FAILED',
+      message: 'The post was found, but its media could not be accessed. Check that it is public and try again.',
+      status: 502,
+    },
+  );
+  assert.doesNotMatch(JSON.stringify(classifyProcessingError(new Error('private stderr'))), /private|stderr/i);
+});
+
+test('extracts nested quote context without inventing flat-post context', () => {
+  const { extractQuoteContext } = require('../server')._internals;
+  const html = `
+    <blockquote class="twitter-tweet">
+      <p>Outer text</p>
+      <a href="https://x.com/outer/status/1">Outer link</a>
+      <blockquote class="twitter-tweet">
+        <p>Quoted text</p>
+        <a href="https://x.com/quoted/status/2">Quoted Author (@quoted)</a>
+      </blockquote>
+    </blockquote>`;
+  assert.deepEqual(extractQuoteContext(html), {
+    authorName: 'Quoted Author',
+    handle: 'quoted',
+    tweetUrl: 'https://x.com/quoted/status/2',
+    text: 'Quoted text',
+  });
+  assert.equal(
+    extractQuoteContext('<blockquote class="twitter-tweet"><p>Only one post</p><a href="https://x.com/outer/status/1">Outer</a></blockquote>'),
+    null,
+  );
+});
+
+test('normalizes job progress to the six conversion stages', () => {
+  const { PIPELINE_STAGES, createJob, emitProgress } = require('../server')._internals;
+  const jobId = '623e4567-e89b-42d3-a456-426614174000';
+  const job = createJob(jobId);
+  const step = emitProgress(jobId, { type: 'step', message: 'Creating WebM...' });
+  assert.deepEqual(PIPELINE_STAGES, [
+    'Fetching tweet metadata...',
+    'Downloading video...',
+    'Rendering tweet card...',
+    'Compositing video...',
+    'Creating GIF...',
+    'Creating WebM...',
+  ]);
+  assert.equal(typeof job.createdAt, 'number');
+  assert.equal(typeof job.startedAt, 'number');
+  assert.equal(step.stepIndex, 6);
+  assert.equal(step.stepCount, 6);
+  assert.ok(step.elapsedMs >= 0);
+});
+
 function requestWithHeaders(pathname, headers) {
   return new Promise((resolve, reject) => {
     const request = http.get(`${base}${pathname}`, { headers }, response => {
