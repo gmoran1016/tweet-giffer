@@ -287,6 +287,48 @@ test('share emits Discord-friendly canonical video metadata', async () => {
   }
 });
 
+test('share emits one canonical video metadata set for WebM', async () => {
+  const id = '623e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.gif`), 'image');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.webm`), 'webm');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.json`), JSON.stringify({
+    authorName: 'Alice', tweetUrl: 'https://x.com/alice/status/12345', width: 598, height: 736,
+  }));
+  process.env.PUBLIC_BASE_URL = 'https://giffer.example.test';
+  try {
+    const response = await fetch(`${base}/share/${id}?f=webm`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.equal((html.match(/<meta property="og:video"/g) || []).length, 1);
+    assert.match(html, /<meta property="og:video:type" content="video\/webm" \/>/);
+    assert.doesNotMatch(html, new RegExp(`${id}\\.mp4"`));
+  } finally {
+    delete process.env.PUBLIC_BASE_URL;
+  }
+});
+
+test('static-card share metadata is not advertised as a video', async () => {
+  const id = '723e4567-e89b-42d3-a456-426614174000';
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.gif`), 'image');
+  await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.json`), JSON.stringify({
+    authorName: 'Alice', staticCard: true, tweetUrl: 'https://x.com/alice/status/12345', width: 598, height: 170,
+  }));
+  process.env.PUBLIC_BASE_URL = 'https://giffer.example.test';
+  try {
+    const response = await fetch(`${base}/share/${id}?f=video`);
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /<meta property="og:type" content="website" \/>/);
+    assert.match(html, /<meta property="og:description" content="Shareable tweet card" \/>/);
+    assert.doesNotMatch(html, /<meta property="og:video"/);
+    assert.match(html, /<img /);
+  } finally {
+    delete process.env.PUBLIC_BASE_URL;
+  }
+});
+
 test('share fallback selects an existing WebM-only output', async () => {
   const id = '323e4567-e89b-42d3-a456-426614174000';
   await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.webm`), 'media');
