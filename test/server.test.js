@@ -254,7 +254,7 @@ test('capacity rejects concurrent work and setup failure releases the slot', asy
       if (status.error) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.equal(status.error, 'Tweet conversion failed. Please try again.');
+    assert.equal(status.error, "We couldn't finish this conversion. Please try again.");
     assert.equal(status.errorCode, 'PROCESSING_FAILED');
     assert.doesNotMatch(JSON.stringify(status), /secret|stderr|session/i);
 
@@ -271,7 +271,7 @@ test('capacity rejects concurrent work and setup failure releases the slot', asy
       if (thirdStatus.error) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.equal(thirdStatus.error, 'Tweet conversion failed. Please try again.');
+    assert.equal(thirdStatus.error, "We couldn't finish this conversion. Please try again.");
     assert.equal(thirdStatus.errorCode, 'PROCESSING_FAILED');
   } finally {
     fs.mkdir = originalMkdir;

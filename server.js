@@ -81,26 +81,55 @@ const tweetCache = new Map(); // tweetId -> videoId
 const jobs = new Map(); // jobId -> { steps, result, error, clients }
 const JOB_TTL_MS = Math.max(1000, Number(process.env.JOB_TTL_MS) || 5 * 60_000);
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 2);
+const PIPELINE_STAGES = Object.freeze([
+  'Fetching tweet metadata...',
+  'Downloading video...',
+  'Rendering tweet card...',
+  'Compositing video...',
+  'Creating GIF...',
+  'Creating WebM...',
+]);
 let activeJobs = 0;
 
 function createJob(jobId) {
-  jobs.set(jobId, { steps: [], result: null, error: null, clients: [], expiresAt: Date.now() + JOB_TTL_MS });
+  const now = Date.now();
+  const job = {
+    steps: [], result: null, error: null, errorCode: null, clients: [],
+    createdAt: now, startedAt: now, completedAt: null,
+    stepIndex: 0, stepCount: PIPELINE_STAGES.length,
+    expiresAt: now + JOB_TTL_MS,
+  };
+  jobs.set(jobId, job);
+  return job;
 }
 
 function emitProgress(jobId, data) {
   const job = jobs.get(jobId);
-  if (!job) return;
-  job.steps.push(data);
+  if (!job) return null;
+  const stageIndex = PIPELINE_STAGES.indexOf(data.message);
+  const normalized = {
+    ...data,
+    ...(stageIndex >= 0 ? { stepIndex: stageIndex + 1 } : {}),
+    stepCount: job.stepCount,
+    elapsedMs: Math.max(0, Date.now() - job.startedAt),
+  };
+  if (stageIndex >= 0) job.stepIndex = stageIndex + 1;
+  job.steps.push(normalized);
   for (const client of job.clients) {
-    try { client.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
+    try { client.write(`data: ${JSON.stringify(normalized)}\n\n`); } catch {}
   }
+  return normalized;
 }
 
 function resolveJob(jobId, result) {
   const job = jobs.get(jobId);
   if (!job) return;
   job.result = result;
-  const msg = `data: ${JSON.stringify({ type: 'done', result })}\n\n`;
+  job.completedAt = Date.now();
+  const msg = `data: ${JSON.stringify({
+    type: 'done', result, stepIndex: job.stepIndex, stepCount: job.stepCount,
+    elapsedMs: job.completedAt - job.startedAt,
+  })}\n\n`;
   for (const client of job.clients) {
     try { client.write(msg); client.end(); } catch {}
   }
@@ -113,12 +142,39 @@ function rejectJob(jobId, error = 'Tweet conversion failed. Please try again.', 
   if (!job) return;
   job.error = error;
   job.errorCode = errorCode;
-  const msg = `data: ${JSON.stringify({ type: 'error', error, errorCode })}\n\n`;
+  job.completedAt = Date.now();
+  const msg = `data: ${JSON.stringify({
+    type: 'error', error, errorCode, stepIndex: job.stepIndex,
+    stepCount: job.stepCount, elapsedMs: job.completedAt - job.startedAt,
+  })}\n\n`;
   for (const client of job.clients) {
     try { client.write(msg); client.end(); } catch {}
   }
   job.clients = [];
   job.expiresAt = Date.now() + JOB_TTL_MS;
+}
+
+function classifyProcessingError(error, phase) {
+  const status = Number(error && error.response && error.response.status);
+  if (phase === 'oembed' && [401, 403, 404].includes(status)) {
+    return {
+      errorCode: 'TWEET_UNAVAILABLE',
+      message: 'This post is unavailable, private, or no longer exists. Check the URL and try another public post.',
+      status: 502,
+    };
+  }
+  if (phase === 'video') {
+    return {
+      errorCode: 'MEDIA_ACCESS_FAILED',
+      message: 'The post was found, but its media could not be accessed. Check that it is public and try again.',
+      status: 502,
+    };
+  }
+  return {
+    errorCode: 'PROCESSING_FAILED',
+    message: "We couldn't finish this conversion. Please try again.",
+    status: 500,
+  };
 }
 
 // ─── Auto-cleanup of old output files (24h) ─────────────────────────────────
@@ -252,6 +308,35 @@ function extractTweetText(oembedHtml) {
     }
   });
   return p.text().trim();
+}
+
+function extractQuoteContext(oembedHtml) {
+  if (typeof oembedHtml !== 'string' || !oembedHtml.trim()) return null;
+  const $ = cheerio.load(oembedHtml);
+  const blocks = $('blockquote.twitter-tweet');
+  if (blocks.length < 2) return null;
+
+  const block = blocks.eq(1);
+  const link = block.find('a[href*="/status/"]').last();
+  const rawUrl = link.attr('href');
+  const parsed = rawUrl ? parseTweetUrl(rawUrl) : null;
+  if (!parsed) return null;
+
+  const paragraph = block.find('p').first().clone();
+  paragraph.find('br').replaceWith('\n');
+  const text = paragraph.text().trim();
+  const linkText = link.text().trim();
+  const handleMatch = linkText.match(/@([A-Za-z0-9_]{1,15})/);
+  const handle = handleMatch ? handleMatch[1] : parsed.username;
+  const authorName = (linkText.replace(/\s*\(@[A-Za-z0-9_]{1,15}\)/, '').trim() || handle);
+  if (!text && !authorName) return null;
+
+  return {
+    authorName,
+    handle,
+    tweetUrl: parsed.canonicalUrl,
+    text,
+  };
 }
 
 function isNoVideoDownloadError(error) {
@@ -776,11 +861,18 @@ app.get('/api/progress/:jobId', (req, res) => {
   }
 
   if (job.result) {
-    res.write(`data: ${JSON.stringify({ type: 'done', result: job.result })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      type: 'done', result: job.result, stepIndex: job.stepIndex,
+      stepCount: job.stepCount, elapsedMs: job.completedAt - job.startedAt,
+    })}\n\n`);
     return res.end();
   }
   if (job.error) {
-    res.write(`data: ${JSON.stringify({ type: 'error', error: job.error, errorCode: job.errorCode })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      type: 'error', error: job.error, errorCode: job.errorCode,
+      stepIndex: job.stepIndex, stepCount: job.stepCount,
+      elapsedMs: job.completedAt - job.startedAt,
+    })}\n\n`);
     return res.end();
   }
 
@@ -802,11 +894,17 @@ app.get('/api/status/:jobId', (req, res) => {
   if (!isUuid(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID' });
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
+  const completedAt = job.completedAt || Date.now();
+  const lastStep = job.steps[job.steps.length - 1] || null;
   res.json({
+    jobId: req.params.jobId,
     done: !!job.result,
     error: job.error || null,
     errorCode: job.errorCode || null,
-    message: job.steps.length > 0 ? job.steps[job.steps.length - 1].message : 'Starting...',
+    message: lastStep ? lastStep.message : 'Starting...',
+    stepIndex: lastStep && lastStep.stepIndex ? lastStep.stepIndex : job.stepIndex,
+    stepCount: job.stepCount,
+    elapsedMs: Math.max(0, completedAt - job.startedAt),
     result: job.result || null,
   });
 });
@@ -814,15 +912,21 @@ app.get('/api/status/:jobId', (req, res) => {
 // ─── Main API endpoint ───────────────────────────────────────────────────────
 app.post('/api/process-tweet', async (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'URL is required' });
+  if (!url) return res.status(400).json({
+    error: 'Enter a valid public Twitter/X post URL.', errorCode: 'INVALID_URL',
+  });
 
   const parsed = parseTweetUrl(url);
-  if (!parsed) return res.status(400).json({ error: 'Invalid Twitter/X URL' });
+  if (!parsed) return res.status(400).json({
+    error: 'Enter a valid public Twitter/X post URL.', errorCode: 'INVALID_URL',
+  });
 
   // Rate limiting
   const ip = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
   if (!checkRateLimit(ip)) {
-    return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
+    return res.status(429).json({
+      error: 'Too many requests. Please wait a minute and try again.', errorCode: 'RATE_LIMITED',
+    });
   }
 
   const { username, tweetId, canonicalUrl } = parsed;
@@ -848,7 +952,9 @@ app.post('/api/process-tweet', async (req, res) => {
   }
 
   if (activeJobs >= MAX_CONCURRENT_JOBS) {
-    return res.status(503).json({ error: 'Conversion capacity is full. Please try again later.' });
+    return res.status(503).json({
+      error: 'Conversion capacity is full. Please try again later.', errorCode: 'CAPACITY_FULL',
+    });
   }
 
   // Return jobId immediately; process async so the client can stream progress
@@ -862,12 +968,14 @@ app.post('/api/process-tweet', async (req, res) => {
     const sessionId = uuidv4();
     const sessionDir = path.join(tempDir, sessionId);
     const partialOutputs = [];
+    let processingPhase = 'setup';
 
     try {
       await fs.mkdir(sessionDir, { recursive: true });
       console.log(`\n── Processing tweet ${tweetId} by @${username} (job ${jobId}) ──`);
 
       // 1. Fetch tweet metadata
+      processingPhase = 'oembed';
       emitProgress(jobId, { type: 'step', message: 'Fetching tweet metadata...' });
       const oembedData = await fetchOEmbed(canonicalUrl);
       const tweetText = extractTweetText(oembedData.html);
@@ -877,6 +985,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.log(`  Tweet date: ${tweetDate ? tweetDate.toISOString() : 'unknown'}`);
 
       // 2. Download video
+      processingPhase = 'video';
       emitProgress(jobId, { type: 'step', message: 'Downloading video...' });
       let videoPath = null;
       let videoInfo = null;
@@ -891,6 +1000,7 @@ app.post('/api/process-tweet', async (req, res) => {
       }
 
       // 3. Fetch avatar
+      processingPhase = 'avatar';
       let avatarFileUrl = null;
       try {
         const avatarPath = path.join(sessionDir, 'avatar.jpg');
@@ -936,6 +1046,7 @@ app.post('/api/process-tweet', async (req, res) => {
       }
 
       // 6. Render tweet HTML and screenshot (uses warm browser pool)
+      processingPhase = 'render';
       emitProgress(jobId, { type: 'step', message: 'Rendering tweet card...' });
       const htmlContent = renderTweetHtml({ authorName, handle: username, tweetText, avatarFileUrl, mediaHtml, cardWidth, tweetDate });
       const htmlPath = path.join(sessionDir, 'tweet.html');
@@ -945,6 +1056,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
 
       // 7. Composite video (rotation applied inline — no pre-encode pass)
+      processingPhase = 'composite';
       emitProgress(jobId, { type: 'step', message: 'Compositing video...' });
       const videoId = uuidv4();
       const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
@@ -960,6 +1072,7 @@ app.post('/api/process-tweet', async (req, res) => {
       console.log('  MP4 created');
 
       // 8. Convert to GIF
+      processingPhase = 'gif';
       emitProgress(jobId, { type: 'step', message: 'Creating GIF...' });
       const gifPath = path.join(outputDir, `${videoId}.gif`);
       partialOutputs.push(gifPath);
@@ -976,6 +1089,7 @@ app.post('/api/process-tweet', async (req, res) => {
       }
 
       // 9. Convert to WebM
+      processingPhase = 'webm';
       emitProgress(jobId, { type: 'step', message: 'Creating WebM...' });
       const webmPath = path.join(outputDir, `${videoId}.webm`);
       partialOutputs.push(webmPath);
@@ -1009,7 +1123,8 @@ app.post('/api/process-tweet', async (req, res) => {
       console.error('Error processing tweet:', error);
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
       await Promise.all(partialOutputs.map(file => fs.rm(file, { force: true }).catch(() => {})));
-      rejectJob(jobId);
+      const safeError = classifyProcessingError(error, processingPhase);
+      rejectJob(jobId, safeError.message, safeError.errorCode);
     } finally {
       activeJobs = Math.max(0, activeJobs - 1);
     }
@@ -1242,4 +1357,17 @@ if (require.main === module) {
   }
 }
 
-module.exports = { app, startServer, stopServer, _internals: { runFfmpegCommand, isNoVideoDownloadError } };
+module.exports = {
+  app,
+  startServer,
+  stopServer,
+  _internals: {
+    runFfmpegCommand,
+    isNoVideoDownloadError,
+    PIPELINE_STAGES,
+    createJob,
+    emitProgress,
+    classifyProcessingError,
+    extractQuoteContext,
+  },
+};
