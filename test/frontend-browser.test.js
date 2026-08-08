@@ -109,8 +109,7 @@ test('refresh restores a pending job and its stage in the real page', { skip: !b
 test('retryable conversion errors preserve the URL and expose retry', { skip: !browserEnabled }, async () => {
   const page = await browser.newPage();
   try {
-    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
-    await page.evaluate(() => {
+    await page.evaluateOnNewDocument(() => {
       localStorage.clear();
       const realFetch = window.fetch.bind(window);
       window.fetch = async (input, init) => {
@@ -123,10 +122,12 @@ test('retryable conversion errors preserve the URL and expose retry', { skip: !b
         return realFetch(input, init);
       };
     });
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => localStorage.clear());
     const url = 'https://x.com/alice/status/123456789';
     await page.type('#tweetUrl', url);
     await page.click('#processBtn');
-    await new Promise(resolve => setTimeout(resolve, 150));
+    await page.waitForFunction(() => !document.getElementById('errorSection').classList.contains('hidden'), { timeout: 1000 });
     const state = await page.evaluate(() => ({
       message: document.getElementById('errorMessage').textContent,
       retryHidden: document.getElementById('retryBtn').classList.contains('hidden'),
