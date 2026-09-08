@@ -22,7 +22,10 @@ test.before(async () => {
   api = require('../server');
   server = await api.startServer({ port: 0, prewarm: false });
   base = `http://127.0.0.1:${server.address().port}`;
-  browser = await puppeteer.launch({ headless: true });
+  browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
 });
 
 test.after(async () => {

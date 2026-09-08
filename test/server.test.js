@@ -419,7 +419,7 @@ test('yt-dlp arguments stay on Twitter extractors and enforce bounded downloads'
   const { buildYtDlpArgs } = require('../server')._internals;
   const args = buildYtDlpArgs('https://x.com/alice/status/123', 'C:\\temp\\session');
   assert.deepEqual(args.slice(0, 3), [
-    'https://x.com/alice/status/123', '-o', 'C:\\temp\\session\\video.%(ext)s',
+    'https://x.com/alice/status/123', '-o', path.join('C:\\temp\\session', 'video.%(ext)s'),
   ]);
   assert.ok(args.includes('--ignore-config'));
   assert.deepEqual(args.slice(args.indexOf('--use-extractors'), args.indexOf('--use-extractors') + 2), ['--use-extractors', 'twitter']);
@@ -444,8 +444,8 @@ test('video metadata parsing accepts small dimensions and maps display rotation 
 
 test('file URLs encode path characters and upstream identity overrides submitted usernames', () => {
   const { toFileUrl, resolveOEmbedIdentity } = require('../server')._internals;
-  const fileUrl = toFileUrl('C:\\audit #fixture\\tweet.html');
-  assert.match(fileUrl, /^file:\/\/\/C:\/audit%20%23fixture\/tweet\.html$/);
+  const fileUrl = toFileUrl(path.join('audit #fixture', 'tweet.html'));
+  assert.match(fileUrl, /\/audit%20%23fixture\/tweet\.html$/);
   assert.deepEqual(resolveOEmbedIdentity({
     author_name: 'Captain America',
     author_url: 'https://x.com/CaptainAmerica',
