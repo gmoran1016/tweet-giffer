@@ -6,7 +6,7 @@ Node/Express service that turns a tweet URL into a tweet-card GIF/MP4/WebM. See 
 
 - `npm run dev` — start with auto-reload (nodemon)
 - `npm start` — start server (`node server.js`)
-- `npm test` — run the test suite (`node --test`, Node 18+, no extra deps)
+- `npm test` — run the test suite (`node --test`, Node 22.12+, no extra deps)
 - `npm run check` — syntax-only check of `server.js` and `public/script.js`
 - Run one test file: `node --test test/security.test.js`
 - Health check: `curl --fail http://localhost:3000/api/health`
@@ -25,7 +25,7 @@ Pipeline: yt-dlp downloads video → Twitter oEmbed for author/text → Puppetee
 ## Gotchas
 
 - **No ffprobe.** `ffmpeg-static` bundles only `ffmpeg`, so `getVideoInfo` parses `ffmpeg -i` stderr with regex. Don't introduce `ffprobe` calls.
-- **yt-dlp is an external dependency**, not in package.json. Locally it must be installed (`pip install yt-dlp`); `findYtDlp()` also probes common Windows install paths. The Docker image bundles it and `docker-entrypoint.sh` refreshes it on container start (as root via `gosu`, toggle with `YTDLP_UPDATE`) — a stale yt-dlp silently breaks Twitter/X extraction (e.g. videos inside quote tweets fall back to a static card).
+- **yt-dlp is an external dependency**, not in package.json. Locally it must be installed (`pip install yt-dlp`); `findYtDlp()` also probes common Windows install paths. The Docker image bundles a build-time-pinned copy and keeps startup offline; update the image build argument when Twitter/X extraction needs a newer extractor.
 - **Puppeteer/Chrome**: locally run `npx puppeteer browsers install chrome` once. In Docker, system Chromium is used via `PUPPETEER_EXECUTABLE_PATH`. A single warm browser is reused across requests.
 - **Video format flag is deliberate**: `-f best[ext=mp4]/best` avoids `bestvideo+bestaudio`, which on Docker picks HLS streams Twitter bakes as landscape with black bars. Rotation is applied inline via FFmpeg `transpose`, not a pre-encode pass.
 - **Concurrency is a hard cap, not a queue**: over `MAX_CONCURRENT_JOBS` returns HTTP 503. Tweet results are cached by tweet ID; outputs older than 24h are auto-deleted.
@@ -34,4 +34,4 @@ Pipeline: yt-dlp downloads video → Twitter oEmbed for author/text → Puppetee
 
 ## CI / release
 
-`.github/workflows/docker.yml` runs on push to `master` only: it builds and pushes `ghcr.io/gmoran1016/tweet-giffer:latest`. CI does **not** run tests or lint — verify with `npm test` and `npm run check` locally before pushing.
+`.github/workflows/docker.yml` runs on push to `master` and manual dispatch: it runs `npm ci`, `npm test`, `npm run check`, and a production dependency audit before building and pushing `ghcr.io/gmoran1016/tweet-giffer:latest`.

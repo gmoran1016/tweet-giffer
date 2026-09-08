@@ -7,8 +7,10 @@ const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
-const ffmpeg = require('fluent-ffmpeg');
-const { spawn, execSync, execFile } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
+const { pathToFileURL } = require('url');
+const dns = require('dns').promises;
+const net = require('net');
 const { parseTweetUrl, isSafeRemoteUrl, escapeHtml, isUuid } = require('./lib/security');
 
 let ffmpegPath;
@@ -22,9 +24,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.disable('x-powered-by');
-app.set('trust proxy', /^(1|true)$/i.test(process.env.TRUST_PROXY || ''));
+const trustedProxyIps = new Set(
+  (process.env.TRUST_PROXY_IPS || '127.0.0.1,::1')
+    .split(',').map(value => value.trim()).filter(Boolean)
+);
+const trustProxyEnabled = /^(1|true)$/i.test(process.env.TRUST_PROXY || '');
+app.set('trust proxy', trustProxyEnabled ? ip => trustedProxyIps.has(String(ip).replace(/^::ffff:/i, '')) : false);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || process.env.CORS_ORIGIN;
-if (allowedOrigin) app.use(cors({ origin: allowedOrigin }));
+if (allowedOrigin && allowedOrigin !== '*') {
+  app.use(cors({ origin: (origin, callback) => callback(null, !origin || origin === allowedOrigin) }));
+}
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -33,20 +42,28 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '4kb' }));
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 const outputDir = path.resolve(process.env.OUTPUT_DIR || path.join(__dirname, 'outputs'));
 const tempDir = path.resolve(process.env.TEMP_DIR || path.join(__dirname, 'temp'));
+
+function positiveEnvNumber(name, fallback, minimum = 1) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= minimum ? value : fallback;
+}
+
+const MAX_DOWNLOAD_BYTES = positiveEnvNumber('MAX_DOWNLOAD_BYTES', 200 * 1024 * 1024);
+const MAX_VIDEO_DURATION_SEC = positiveEnvNumber('MAX_VIDEO_DURATION_SEC', 10 * 60);
+const MAX_VIDEO_DIMENSION = positiveEnvNumber('MAX_VIDEO_DIMENSION', 4096);
+const MAX_OUTPUT_BYTES = positiveEnvNumber('MAX_OUTPUT_BYTES', 5 * 1024 * 1024 * 1024);
+const MAX_REMOTE_MEDIA_BYTES = positiveEnvNumber('MAX_REMOTE_MEDIA_BYTES', 10 * 1024 * 1024);
 
 async function ensureDirectories() {
   await fs.mkdir(outputDir, { recursive: true });
   await fs.mkdir(tempDir, { recursive: true });
 }
 
-if (ffmpegPath) {
-  ffmpeg.setFfmpegPath(ffmpegPath);
-  console.log('Using bundled FFmpeg');
-}
+if (ffmpegPath) console.log('Using bundled FFmpeg');
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -80,6 +97,7 @@ const tweetCache = new Map(); // tweetId -> videoId
 // ─── Job progress tracking (SSE) ────────────────────────────────────────────
 const jobs = new Map(); // jobId -> { steps, result, error, clients }
 const JOB_TTL_MS = Math.max(1000, Number(process.env.JOB_TTL_MS) || 5 * 60_000);
+const JOB_TIMEOUT_MS = Math.max(30_000, Number(process.env.JOB_TIMEOUT_MS) || 15 * 60_000);
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 2);
 const PIPELINE_STAGES = Object.freeze([
   'Fetching tweet metadata...',
@@ -90,6 +108,11 @@ const PIPELINE_STAGES = Object.freeze([
   'Creating WebM...',
 ]);
 let activeJobs = 0;
+const inFlightTweets = new Map(); // tweetId -> jobId
+const activeProcesses = new Set();
+const activeSessionDirs = new Set();
+let serverStopping = false;
+let serverGeneration = 0;
 
 function createJob(jobId) {
   const now = Date.now();
@@ -97,7 +120,10 @@ function createJob(jobId) {
     steps: [], result: null, error: null, errorCode: null, clients: [],
     createdAt: now, startedAt: now, completedAt: null,
     stepIndex: 0, stepCount: PIPELINE_STAGES.length,
-    expiresAt: now + JOB_TTL_MS,
+    expiresAt: null,
+    deadlineAt: now + JOB_TIMEOUT_MS,
+    generation: serverGeneration,
+    active: true,
   };
   jobs.set(jobId, job);
   return job;
@@ -135,6 +161,7 @@ function resolveJob(jobId, result) {
   }
   job.clients = [];
   job.expiresAt = Date.now() + JOB_TTL_MS;
+  if (job.tweetId && inFlightTweets.get(job.tweetId) === jobId) inFlightTweets.delete(job.tweetId);
 }
 
 function rejectJob(jobId, error = 'Tweet conversion failed. Please try again.', errorCode = 'PROCESSING_FAILED') {
@@ -152,6 +179,25 @@ function rejectJob(jobId, error = 'Tweet conversion failed. Please try again.', 
   }
   job.clients = [];
   job.expiresAt = Date.now() + JOB_TTL_MS;
+  if (job.tweetId && inFlightTweets.get(job.tweetId) === jobId) inFlightTweets.delete(job.tweetId);
+}
+
+function pruneExpiredJobs(now = Date.now()) {
+  for (const [id, job] of jobs) {
+    if (job.completedAt && job.expiresAt && job.expiresAt <= now && job.clients.length === 0) jobs.delete(id);
+  }
+}
+
+function assertJobWithinDeadline(jobId) {
+  const job = jobs.get(jobId);
+  if (serverStopping || !job || job.generation !== serverGeneration || (job.deadlineAt && Date.now() > job.deadlineAt)) {
+    throw new Error('Tweet conversion exceeded the processing time limit');
+  }
+}
+
+function boundedTimeout(deadlineAt, fallback) {
+  if (!deadlineAt) return fallback;
+  return Math.max(1, Math.min(fallback, deadlineAt - Date.now()));
 }
 
 function classifyProcessingError(error, phase) {
@@ -168,6 +214,13 @@ function classifyProcessingError(error, phase) {
       errorCode: 'MEDIA_ACCESS_FAILED',
       message: 'The post was found, but its media could not be accessed. Check that it is public and try again.',
       status: 502,
+    };
+  }
+  if (phase === 'timeout') {
+    return {
+      errorCode: 'PROCESSING_TIMEOUT',
+      message: 'This conversion took too long and was stopped. Please try again.',
+      status: 504,
     };
   }
   return {
@@ -193,6 +246,7 @@ async function cleanOldOutputs(maxAgeHours = 24) {
       }
     }
     if (removed) console.log(`Cleanup: removed ${removed} output file(s) older than ${maxAgeHours}h`);
+    await pruneTweetCache();
   } catch (e) {
     console.warn('Cleanup error:', e.message);
   }
@@ -200,6 +254,8 @@ async function cleanOldOutputs(maxAgeHours = 24) {
 
 // ─── Puppeteer browser pool (singleton — warm browser reused across requests) ─
 let _browser = null;
+let browserLaunch = null;
+let browserLastError = null;
 
 async function getPuppeteerOpts() {
   const opts = {
@@ -207,8 +263,6 @@ async function getPuppeteerOpts() {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-web-security',
-      '--allow-file-access-from-files',
     ],
   };
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
@@ -226,16 +280,100 @@ async function getBrowser() {
       _browser = null;
     }
   }
-  _browser = await puppeteer.launch(await getPuppeteerOpts());
-  console.log('Puppeteer browser started');
-  return _browser;
+  if (browserLaunch) return browserLaunch;
+  browserLaunch = (async () => {
+    try {
+      const browser = await puppeteer.launch(await getPuppeteerOpts());
+      _browser = browser;
+      browserLastError = null;
+      console.log('Puppeteer browser started');
+      return browser;
+    } catch (error) {
+      browserLastError = error;
+      throw error;
+    } finally {
+      browserLaunch = null;
+    }
+  })();
+  return browserLaunch;
+}
+
+async function cleanOldTempDirs(maxAgeHours = 24) {
+  const cutoff = Date.now() - maxAgeHours * 3_600_000;
+  try {
+    const entries = await fs.readdir(tempDir, { withFileTypes: true });
+    let removed = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isUuid(entry.name)) continue;
+      const dir = path.join(tempDir, entry.name);
+      if (activeSessionDirs.has(dir)) continue;
+      const stat = await fs.stat(dir).catch(() => null);
+      if (stat && stat.mtimeMs < cutoff) {
+        await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+        removed++;
+      }
+    }
+    if (removed) console.log(`Cleanup: removed ${removed} temporary session(s) older than ${maxAgeHours}h`);
+  } catch (error) {
+    console.warn('Temporary cleanup error:', error.message);
+  }
+}
+
+async function pruneTweetCache() {
+  for (const [tweetId, videoId] of tweetCache) {
+    const mp4Exists = await fs.access(path.join(outputDir, `${videoId}.mp4`)).then(() => true).catch(() => false);
+    const gifExists = await fs.access(path.join(outputDir, `${videoId}.gif`)).then(() => true).catch(() => false);
+    if (!mp4Exists || !gifExists) tweetCache.delete(tweetId);
+  }
+}
+
+async function hydrateTweetCache() {
+  const files = await fs.readdir(outputDir).catch(() => []);
+  for (const file of files) {
+    if (!/^[0-9a-f-]{36}\.json$/i.test(file)) continue;
+    const videoId = file.slice(0, -5);
+    const metadata = await fs.readFile(path.join(outputDir, file), 'utf8').then(JSON.parse).catch(() => null);
+    const parsed = typeof metadata?.tweetId === 'string' && /^\d+$/.test(metadata.tweetId)
+      ? { tweetId: metadata.tweetId }
+      : (metadata?.tweetUrl ? parseTweetUrl(metadata.tweetUrl) : null);
+    if (!parsed) continue;
+    const mp4Exists = await fs.access(path.join(outputDir, `${videoId}.mp4`)).then(() => true).catch(() => false);
+    const gifExists = await fs.access(path.join(outputDir, `${videoId}.gif`)).then(() => true).catch(() => false);
+    if (mp4Exists && gifExists) tweetCache.set(parsed.tweetId, videoId);
+  }
+}
+
+async function getOutputUsageBytes() {
+  let total = 0;
+  const files = await fs.readdir(outputDir).catch(() => []);
+  for (const file of files) {
+    if (!/\.(mp4|gif|webm|json)$/i.test(file)) continue;
+    const stat = await fs.stat(path.join(outputDir, file)).catch(() => null);
+    if (stat?.isFile()) total += stat.size;
+  }
+  return total;
+}
+
+async function writeJsonAtomic(filePath, value) {
+  const tempPath = `${filePath}.${uuidv4()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(value), 'utf8');
+    await fs.rename(tempPath, filePath);
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
+async function assertOutputUsageWithinLimit() {
+  const usage = await getOutputUsageBytes();
+  if (usage > MAX_OUTPUT_BYTES) throw new Error('Generated outputs exceed the storage limit');
 }
 
 // ─── yt-dlp discovery ────────────────────────────────────────────────────────
 function findYtDlp() {
   // 1. Try yt-dlp directly (if in PATH)
   try {
-    execSync('yt-dlp --version', { stdio: 'pipe', timeout: 5000 });
+    execFileSync('yt-dlp', ['--version'], { stdio: 'pipe', timeout: 5000 });
     return 'yt-dlp';
   } catch {}
 
@@ -256,10 +394,12 @@ function findYtDlp() {
   candidates.push(path.join(process.env.USERPROFILE || '', 'scoop', 'shims', 'yt-dlp.exe'));
 
   for (const c of candidates) {
-    if (fsSync.existsSync(c)) {
-      console.log(`Found yt-dlp at: ${c}`);
-      return c;
-    }
+    try {
+      if (fsSync.statSync(c).isFile()) {
+        console.log(`Found yt-dlp at: ${c}`);
+        return c;
+      }
+    } catch {}
   }
   return null;
 }
@@ -272,9 +412,37 @@ if (YT_DLP) {
   console.warn('Install with: pip install yt-dlp');
 }
 
-// Convert local path to file:// URL (handles Windows backslashes)
+function formatYtDlpSize(bytes) {
+  // yt-dlp accepts a bare byte count; using it avoids rounding a small
+  // deployment-specific limit up to a whole megabyte.
+  return String(Math.max(1, Math.floor(bytes)));
+}
+
+function buildYtDlpArgs(tweetUrl, sessionDir) {
+  const outputTemplate = path.join(sessionDir, 'video.%(ext)s');
+  return [
+    tweetUrl,
+    '-o', outputTemplate,
+    '--no-playlist',
+    '--ignore-config',
+    '--use-extractors', 'twitter',
+    '--max-downloads', '1',
+    '--max-filesize', formatYtDlpSize(MAX_DOWNLOAD_BYTES),
+    '--match-filter', `duration <= ${MAX_VIDEO_DURATION_SEC} & width <= ${MAX_VIDEO_DIMENSION} & height <= ${MAX_VIDEO_DIMENSION}`,
+    '--socket-timeout', '30',
+    '--merge-output-format', 'mp4',
+    // Use combined (muxed) formats first — these are always natively oriented.
+    // Avoid bestvideo+bestaudio which on Docker picks HLS video-only streams that
+    // Twitter encodes as landscape with black bars baked in.
+    '-f', 'best[ext=mp4]/best',
+    '--no-warnings',
+    '--quiet',
+  ];
+}
+
+// Convert local path to file:// URL with correct escaping on every platform.
 function toFileUrl(p) {
-  return 'file:///' + path.resolve(p).replace(/\\/g, '/');
+  return pathToFileURL(path.resolve(p)).href;
 }
 
 // Derive tweet date from Twitter snowflake ID
@@ -291,6 +459,10 @@ async function fetchOEmbed(tweetUrl) {
   const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`;
   const response = await axios.get(oembedUrl, {
     timeout: 15000,
+    maxContentLength: MAX_REMOTE_MEDIA_BYTES,
+    maxBodyLength: MAX_REMOTE_MEDIA_BYTES,
+    maxRedirects: 0,
+    validateStatus: status => status >= 200 && status < 300,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible)' }
   });
   return response.data;
@@ -353,6 +525,35 @@ function buildResultMetadata({ authorName, staticCard, quoteContext }) {
   };
 }
 
+function profileHandleFromUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = new URL(value);
+    if (!['x.com', 'twitter.com', 'www.x.com', 'www.twitter.com'].includes(parsed.hostname.toLowerCase())) return null;
+    if (parsed.username || parsed.password || parsed.port) return null;
+    const match = parsed.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveOEmbedIdentity(oembedData, fallback) {
+  const safeFallback = fallback || {};
+  const fallbackParsed = parseTweetUrl(safeFallback.canonicalUrl || '');
+  const upstreamTweet = parseTweetUrl(typeof oembedData?.url === 'string' ? oembedData.url : '');
+  const handle = profileHandleFromUrl(oembedData?.author_url) || upstreamTweet?.username || safeFallback.username || 'user';
+  const authorName = typeof oembedData?.author_name === 'string' && oembedData.author_name.trim()
+    ? oembedData.author_name.trim()
+    : handle;
+  const sameTweet = upstreamTweet && (!safeFallback.tweetId || upstreamTweet.tweetId === safeFallback.tweetId);
+  return {
+    authorName,
+    handle,
+    tweetUrl: sameTweet ? upstreamTweet.canonicalUrl : (fallbackParsed?.canonicalUrl || safeFallback.canonicalUrl || null),
+  };
+}
+
 async function readOutputMetadata(videoId) {
   try {
     const raw = await fs.readFile(path.join(outputDir, `${videoId}.json`), 'utf8');
@@ -365,31 +566,19 @@ async function readOutputMetadata(videoId) {
 
 function isNoVideoDownloadError(error) {
   const message = error instanceof Error ? error.message : String(error || '');
-  return /\bno (?:video|media) formats? found\b|\bno video found\b/i.test(message);
+  return /\bno (?:video|media) formats? found\b|\bno video (?:could be )?found\b/i.test(message);
 }
 
 // Download video using yt-dlp
-async function downloadVideoYtDlp(tweetUrl, sessionDir) {
+async function downloadVideoYtDlp(tweetUrl, sessionDir, timeoutMs = 120000) {
   if (!YT_DLP) throw new Error('yt-dlp is not installed. Run: pip install yt-dlp');
 
-  const outputTemplate = path.join(sessionDir, 'video.%(ext)s');
-
   return new Promise((resolve, reject) => {
-    const args = [
-      tweetUrl,
-      '-o', outputTemplate,
-      '--no-playlist',
-      '--merge-output-format', 'mp4',
-      // Use combined (muxed) formats first — these are always natively oriented.
-      // Avoid bestvideo+bestaudio which on Docker picks HLS video-only streams that
-      // Twitter encodes as landscape with black bars baked in.
-      '-f', 'best[ext=mp4]/best',
-      '--no-warnings',
-      '--quiet',
-    ];
+    const args = buildYtDlpArgs(tweetUrl, sessionDir);
 
     console.log('Running yt-dlp...');
     const proc = spawn(YT_DLP, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    activeProcesses.add(proc);
 
     let stderr = '';
     let settled = false;
@@ -397,6 +586,7 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      activeProcesses.delete(proc);
       fn(value);
     };
     proc.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-8192); });
@@ -409,9 +599,10 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
         if (videoFile) {
           const fullPath = path.join(sessionDir, videoFile);
           const stats = await fs.stat(fullPath);
-          if (stats.size > 10000) {
+          if (stats.isFile() && stats.size > 10000 && stats.size <= MAX_DOWNLOAD_BYTES) {
             return finish(resolve, fullPath);
           }
+          if (stats.size > MAX_DOWNLOAD_BYTES) throw new Error(`Downloaded video exceeds the ${formatYtDlpSize(MAX_DOWNLOAD_BYTES)} limit`);
         }
         finish(reject, new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
       } catch (e) {
@@ -425,71 +616,100 @@ async function downloadVideoYtDlp(tweetUrl, sessionDir) {
 
     const timer = setTimeout(() => {
       proc.kill('SIGKILL');
-      finish(reject, new Error('yt-dlp timed out after 120s'));
-    }, 120000);
+      finish(reject, new Error(`yt-dlp timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
   });
 }
 
 // Get video dimensions, duration, and audio presence using ffmpeg -i
 // (avoids needing ffprobe, which ffmpeg-static does not bundle)
-async function getVideoInfo(videoPath) {
-  const ffmpegBin = ffmpegPath || 'ffmpeg';
+function parseVideoInfoOutput(output) {
+  const text = String(output || '');
+  const videoMatch = text.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{2,5})x(\d{2,5})(?:[ ,\[]|$)/im);
+  if (!videoMatch) return null;
+  let width = parseInt(videoMatch[1], 10);
+  let height = parseInt(videoMatch[2], 10);
+  const hasAudio = /Stream #\S+: Audio:/i.test(text);
+  let rotation = 0;
+  const rotateMeta = text.match(/rotate\s*:\s*(-?\d+)/i) || text.match(/rotation of (-?\d+(?:\.\d+)?) degrees/i);
+  if (rotateMeta) {
+    const rawDeg = Math.round(parseFloat(rotateMeta[1]));
+    rotation = ((rawDeg % 360) + 360) % 360;
+    if (![0, 90, 180, 270].includes(rotation)) rotation = 0;
+    if (rotation === 90 || rotation === 270) [width, height] = [height, width];
+  }
+  const durMatch = text.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+  const duration = durMatch
+    ? parseInt(durMatch[1], 10) * 3600 + parseInt(durMatch[2], 10) * 60 + parseFloat(durMatch[3])
+    : null;
+  return { width, height, duration, hasAudio, rotation };
+}
 
-  return new Promise((resolve) => {
+async function getVideoInfo(videoPath, timeoutMs = 15000) {
+  const ffmpegBin = ffmpegPath && fsSync.existsSync(ffmpegPath) ? ffmpegPath : 'ffmpeg';
+  return new Promise((resolve, reject) => {
     // ffmpeg -i always exits non-zero but writes full stream info to stderr
-    execFile(ffmpegBin, ['-i', videoPath, '-hide_banner'], { timeout: 15000 }, (err, stdout, stderr) => {
-      const output = stderr || '';
-
-      const hasAudio = /Stream #\S+: Audio:/i.test(output);
-
-      // Match WxH in the Video stream line. Dimensions are 3-5 digits each, preceded by
-      // space/comma and followed by space/comma/bracket (or end of line).
-      const videoMatch =
-        output.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{3,5})x(\d{3,5})[ ,\[]/) ||
-        output.match(/Stream #\S+: Video:[^\n]*?[ ,](\d{3,5})x(\d{3,5})$/m);
-      let width  = videoMatch ? parseInt(videoMatch[1], 10) : 1280;
-      let height = videoMatch ? parseInt(videoMatch[2], 10) : 720;
-      if (!videoMatch) console.warn('  WARNING: could not detect video dimensions — using 1280x720 fallback');
-
-      // Detect rotation metadata — phones often store portrait video as landscape + rotate tag.
-      let rotation = 0;
-      const rotateMeta = output.match(/rotate\s*:\s*(-?\d+)/i) ||
-                         output.match(/rotation of (-?\d+(?:\.\d+)?) degrees/i);
-      if (rotateMeta) {
-        const rawDeg = Math.round(parseFloat(rotateMeta[1]));
-        rotation = ((rawDeg % 360) + 360) % 360;
-        if (rotation === 90 || rotation === 270) {
-          [width, height] = [height, width];
-          console.log(`  Detected rotation ${rotation}° — swapped to display dimensions ${width}x${height}`);
-        } else if (rotation === 180) {
-          console.log(`  Detected rotation 180°`);
-        } else {
-          rotation = 0;
-        }
+    execFile(ffmpegBin, ['-i', videoPath, '-hide_banner'], { timeout: timeoutMs }, (err, stdout, stderr) => {
+      if (err && (err.killed || err.code === 'ETIMEDOUT')) return reject(new Error('Unable to read video metadata'));
+      const info = parseVideoInfoOutput(stderr || '');
+      if (!info || !Number.isFinite(info.duration) || info.duration <= 0) {
+        return reject(new Error('Unable to read video metadata'));
       }
-
-      const durMatch = output.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-      const duration = durMatch
-        ? parseInt(durMatch[1], 10) * 3600 + parseInt(durMatch[2], 10) * 60 + parseFloat(durMatch[3])
-        : 10;
-
-      console.log(`  ffmpeg info → ${width}x${height}, ${duration.toFixed(1)}s, audio=${hasAudio}, rotation=${rotation}`);
-
-      resolve({ width, height, duration, hasAudio, rotation });
+      if (info.width > MAX_VIDEO_DIMENSION || info.height > MAX_VIDEO_DIMENSION) {
+        return reject(new Error(`Video dimensions exceed the ${MAX_VIDEO_DIMENSION}px limit`));
+      }
+      if (info.duration > MAX_VIDEO_DURATION_SEC) {
+        return reject(new Error(`Video duration exceeds the ${MAX_VIDEO_DURATION_SEC}s limit`));
+      }
+      console.log(`  ffmpeg info → ${info.width}x${info.height}, ${info.duration.toFixed(1)}s, audio=${info.hasAudio}, rotation=${info.rotation}`);
+      resolve(info);
     });
   });
 }
 
+function isPrivateIp(address) {
+  const value = String(address || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (value === '::' || value === '::1') return true;
+  if (value.startsWith('::ffff:')) {
+    const mapped = value.slice(7);
+    if (net.isIP(mapped) === 4) return isPrivateIp(mapped);
+    const mappedParts = mapped.split(':');
+    if (mappedParts.length === 2 && mappedParts.every(part => /^[0-9a-f]{1,4}$/.test(part))) {
+      const first = parseInt(mappedParts[0], 16);
+      const second = parseInt(mappedParts[1], 16);
+      return isPrivateIp(`${first >>> 8}.${first & 255}.${second >>> 8}.${second & 255}`);
+    }
+  }
+  if (net.isIP(value) === 6 && (value.startsWith('fc') || value.startsWith('fd') || /^fe[89ab]/.test(value))) return true;
+  const octets = value.split('.').map(Number);
+  if (octets.length !== 4 || octets.some(o => !Number.isInteger(o) || o < 0 || o > 255)) return false;
+  const [first, second] = octets;
+  return first === 0 || first === 10 || first === 127 || first >= 224 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && (second === 0 || second === 168)) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    (first === 203 && second === 0);
+}
+
+async function assertSafeRemoteDestination(value, allowedHosts) {
+  if (!isSafeRemoteUrl(value, allowedHosts)) throw new Error('Unsafe remote media URL');
+  const hostname = new URL(value).hostname;
+  const records = await dns.lookup(hostname, { all: true, verbatim: true });
+  if (records.some(record => isPrivateIp(record.address))) throw new Error('Unsafe remote media destination');
+}
+
 // Download a file (image/avatar)
-async function downloadFile(url, filePath) {
+async function downloadFile(url, filePath, timeoutMs = 10000) {
   const allowedHosts = new Set(['unavatar.io', 'pbs.twimg.com', 'video.twimg.com', 'abs.twimg.com']);
   let currentUrl = url;
   let response;
   for (let redirects = 0; redirects <= 3; redirects++) {
-    if (!isSafeRemoteUrl(currentUrl, allowedHosts)) throw new Error('Unsafe remote media URL');
+    await assertSafeRemoteDestination(currentUrl, allowedHosts);
     response = await axios.get(currentUrl, {
-      responseType: 'arraybuffer', timeout: 10000,
-      maxContentLength: 10 * 1024 * 1024, maxBodyLength: 10 * 1024 * 1024,
+      responseType: 'arraybuffer', timeout: timeoutMs,
+      maxContentLength: MAX_REMOTE_MEDIA_BYTES, maxBodyLength: MAX_REMOTE_MEDIA_BYTES,
       maxRedirects: 0, validateStatus: status => status >= 200 && status < 400,
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' },
     });
@@ -497,6 +717,9 @@ async function downloadFile(url, filePath) {
     const location = response.headers.location;
     if (!location || redirects === 3) throw new Error('Too many remote media redirects');
     currentUrl = new URL(location, currentUrl).href;
+  }
+  if (!response || !Buffer.isBuffer(response.data) || response.data.length > MAX_REMOTE_MEDIA_BYTES) {
+    throw new Error('Remote media exceeds the size limit');
   }
   await fs.writeFile(filePath, Buffer.from(response.data));
   return filePath;
@@ -688,19 +911,20 @@ body {
 }
 
 // Take a screenshot of the tweet card using the shared browser pool
-async function screenshotTweet(htmlPath) {
+async function screenshotTweet(htmlPath, timeoutMs = 30000) {
   const browser = await getBrowser();
   const page = await browser.newPage();
 
   try {
     await page.setViewport({ width: 700, height: 1400, deviceScaleFactor: 1 });
-    await page.goto(toFileUrl(htmlPath), { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.goto(toFileUrl(htmlPath), { waitUntil: 'networkidle0', timeout: timeoutMs });
 
-    await page.evaluate(() => Promise.all(
+    const imageWaitMs = Math.min(4000, Math.max(100, timeoutMs));
+    await page.evaluate((waitMs) => Promise.all(
       Array.from(document.images).map(img =>
-        img.complete ? null : new Promise(r => { img.onload = r; img.onerror = r; setTimeout(r, 4000); })
+        img.complete ? null : new Promise(r => { img.onload = r; img.onerror = r; setTimeout(r, waitMs); })
       ).filter(Boolean)
-    ));
+    ), imageWaitMs);
     await delay(300);
 
     const cardEl = await page.$('.tweet-card');
@@ -739,6 +963,13 @@ async function screenshotTweet(htmlPath) {
 // rotation is handled inline via transpose filter — no pre-encode step needed.
 const FFMPEG_TIMEOUT_MS = Math.max(5_000, Number(process.env.FFMPEG_TIMEOUT_MS) || 5 * 60_000);
 
+function rotationFilterFor(rotation) {
+  if (rotation === 90) return 'transpose=2,';
+  if (rotation === 270) return 'transpose=1,';
+  if (rotation === 180) return 'vflip,hflip,';
+  return '';
+}
+
 function runFfmpegCommand(command, options = {}) {
   const { label = 'FFmpeg conversion', timeoutMs = FFMPEG_TIMEOUT_MS, onStart, onStderr, onProgress } = options;
   return new Promise((resolve, reject) => {
@@ -763,7 +994,7 @@ function runFfmpegCommand(command, options = {}) {
   });
 }
 
-async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false, rotation = 0) {
+async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, hasAudio = false, rotation = 0, deadlineAt = null) {
   const { x, y } = videoArea;
   // libx264 requires dimensions divisible by 2 — round down
   const width  = videoArea.width  % 2 === 0 ? videoArea.width  : videoArea.width  - 1;
@@ -771,12 +1002,10 @@ async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, 
 
   // Apply rotation in the filter chain (avoids a separate pre-encode pass)
   // These transpose values match FFmpeg's transpose filter: 1=CW90, 2=CCW90
-  let rotateFilter = '';
-  if      (rotation === 90)  rotateFilter = 'transpose=1,';
-  else if (rotation === 270) rotateFilter = 'transpose=2,';
-  else if (rotation === 180) rotateFilter = 'vflip,hflip,';
+  const rotateFilter = rotationFilterFor(rotation);
 
   const outputOpts = [
+    '-y',
     '-map', '[out]',
     '-pix_fmt', 'yuv420p',
     '-c:v', 'libx264',
@@ -791,24 +1020,19 @@ async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, 
 
   let stderrLog = '';
 
-  const cmd = ffmpeg()
-      .input(screenshotPath)
-      .inputOptions(['-loop', '1'])
-      .input(videoPath)
-      .inputOptions(['-noautorotate'])  // we apply rotation ourselves via rotateFilter
-      .complexFilter([
-        // Rotate (if needed), then scale to fit placeholder, pad any remaining space with black
-        `[1:v]${rotateFilter}scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-          `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black[vid]`,
-        `[0:v][vid]overlay=${x}:${y}:shortest=1[v1]`,
-        // libx264 requires even dimensions — round down via trunc
-        `[v1]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]`,
-      ])
-      .outputOptions(outputOpts)
-      .output(outputPath);
+  const filter = [
+    // Rotate (if needed), then scale to fit placeholder, pad any remaining space with black
+    `[1:v]${rotateFilter}scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black[vid]`,
+    `[0:v][vid]overlay=${x}:${y}:shortest=1[v1]`,
+    // libx264 requires even dimensions — round down via trunc
+    `[v1]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]`,
+  ].join(';');
+  const args = ['-loop', '1', '-i', screenshotPath, '-noautorotate', '-i', videoPath, '-filter_complex', filter, ...outputOpts, outputPath];
   try {
-    await runFfmpegCommand(cmd, {
+    await runFfmpegArgs(args, {
       label: 'FFmpeg composite',
+      timeoutMs: boundedTimeout(deadlineAt, FFMPEG_TIMEOUT_MS),
       onStart: command => console.log('  FFmpeg cmd:', command),
       onStderr: line => { stderrLog = (stderrLog + line + '\n').slice(-8192); },
       onProgress: p => p.percent && console.log(`  Encoding: ${Math.round(p.percent)}%`),
@@ -816,31 +1040,25 @@ async function compositeVideo(screenshotPath, videoPath, videoArea, outputPath, 
     return outputPath;
   } catch (error) {
     console.error('  FFmpeg stderr:\n' + stderrLog.slice(-2000));
+    if (/timed out|time limit/i.test(error.message || '')) throw error;
     if (hasAudio) {
       console.warn('  Retrying without audio...');
-      return compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false, rotation);
+      return compositeVideo(screenshotPath, videoPath, videoArea, outputPath, false, rotation, deadlineAt);
     }
     throw new Error(`FFmpeg composite failed: ${error.message}\n${stderrLog.slice(-500)}`);
   }
 }
 
 // Create a short video from a static screenshot (tweets without video)
-async function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) {
-  const command = ffmpeg()
-      .input(screenshotPath)
-      .inputOptions(['-loop', '1', '-framerate', '1'])
-      .outputOptions([
-        `-t`, String(durationSecs),
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-pix_fmt', 'yuv420p',
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '18',
-        '-movflags', '+faststart',
-      ])
-      .output(outputPath);
+async function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5, deadlineAt = null) {
+  const args = [
+    '-y', '-loop', '1', '-framerate', '1', '-i', screenshotPath,
+    '-t', String(durationSecs), '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+    '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+    '-movflags', '+faststart', outputPath,
+  ];
   try {
-    await runFfmpegCommand(command, { label: 'FFmpeg static video' });
+    await runFfmpegArgs(args, { label: 'FFmpeg static video', timeoutMs: boundedTimeout(deadlineAt, FFMPEG_TIMEOUT_MS) });
     return outputPath;
   } catch (error) {
     throw new Error(`FFmpeg static video failed: ${error.message}`);
@@ -848,27 +1066,18 @@ async function staticImageToVideo(screenshotPath, outputPath, durationSecs = 5) 
 }
 
 // Convert video to GIF (palette-optimized for quality)
-async function videoToGif(videoPath, gifPath, targetWidth = 598) {
+async function videoToGif(videoPath, gifPath, targetWidth = 598, deadlineAt = null) {
   const palettePath = gifPath.replace('.gif', '_pal.png');
 
   // Pass 1: generate palette
   try {
-    const paletteCommand = ffmpeg(videoPath)
-      .outputOptions([
-        '-vf', `fps=15,scale=${targetWidth}:-1:flags=lanczos,palettegen=max_colors=256:reserve_transparent=0`,
-        '-y',
-      ])
-      .output(palettePath);
-    await runFfmpegCommand(paletteCommand, { label: 'FFmpeg GIF palette' });
+    const paletteArgs = ['-y', '-i', videoPath, '-vf', `fps=15,scale=${targetWidth}:-1:flags=lanczos,palettegen=max_colors=256:reserve_transparent=0`, palettePath];
+    await runFfmpegArgs(paletteArgs, { label: 'FFmpeg GIF palette', timeoutMs: boundedTimeout(deadlineAt, FFMPEG_TIMEOUT_MS) });
 
     // Pass 2: render GIF using palette
-    const gifCommand = ffmpeg(videoPath)
-      .input(palettePath)
-      .complexFilter([
-        `[0:v]fps=15,scale=${targetWidth}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer`,
-      ])
-      .output(gifPath);
-    await runFfmpegCommand(gifCommand, { label: 'FFmpeg GIF render' });
+    const gifArgs = ['-y', '-i', videoPath, '-i', palettePath, '-filter_complex',
+      `[0:v]fps=15,scale=${targetWidth}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer`, gifPath];
+    await runFfmpegArgs(gifArgs, { label: 'FFmpeg GIF render', timeoutMs: boundedTimeout(deadlineAt, FFMPEG_TIMEOUT_MS) });
   } finally {
     await fs.unlink(palettePath).catch(() => {});
   }
@@ -876,20 +1085,12 @@ async function videoToGif(videoPath, gifPath, targetWidth = 598) {
 }
 
 // Convert video to WebM (VP9 + Opus — smaller than MP4, plays in all modern browsers)
-async function videoToWebm(videoPath, webmPath) {
-  const command = ffmpeg(videoPath)
-      .outputOptions([
-        '-c:v', 'libvpx-vp9',
-        '-crf', '28',
-        '-b:v', '0',          // CRF-only mode (best quality/size ratio)
-        '-c:a', 'libopus',
-        '-b:a', '128k',
-        '-deadline', 'good',
-        '-cpu-used', '2',
-      ])
-      .output(webmPath);
-  await runFfmpegCommand(command, {
+async function videoToWebm(videoPath, webmPath, deadlineAt = null) {
+  const args = ['-y', '-i', videoPath, '-c:v', 'libvpx-vp9', '-crf', '28', '-b:v', '0',
+    '-c:a', 'libopus', '-b:a', '128k', '-deadline', 'good', '-cpu-used', '2', webmPath];
+  await runFfmpegArgs(args, {
     label: 'FFmpeg WebM',
+    timeoutMs: boundedTimeout(deadlineAt, FFMPEG_TIMEOUT_MS),
     onProgress: p => p.percent && console.log(`  WebM: ${Math.round(p.percent)}%`),
   });
   return webmPath;
@@ -974,7 +1175,7 @@ app.post('/api/process-tweet', async (req, res) => {
   });
 
   // Rate limiting
-  const ip = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
   if (!checkRateLimit(ip)) {
     return res.status(429).json({
       error: 'Too many requests. Please wait a minute and try again.', errorCode: 'RATE_LIMITED',
@@ -982,6 +1183,12 @@ app.post('/api/process-tweet', async (req, res) => {
   }
 
   const { username, tweetId, canonicalUrl } = parsed;
+
+  const inFlightJobId = inFlightTweets.get(tweetId);
+  if (inFlightJobId && jobs.has(inFlightJobId)) {
+    return res.json({ success: true, jobId: inFlightJobId, queued: true });
+  }
+  if (inFlightJobId) inFlightTweets.delete(tweetId);
 
   // Cache check — return existing output if files are still on disk
   const cachedVideoId = tweetCache.get(tweetId);
@@ -1005,6 +1212,17 @@ app.post('/api/process-tweet', async (req, res) => {
     tweetCache.delete(tweetId); // stale entry
   }
 
+  try {
+    const usage = await getOutputUsageBytes();
+    if (usage >= MAX_OUTPUT_BYTES) {
+      return res.status(507).json({
+        error: 'Output storage is full. Please try again later.', errorCode: 'OUTPUT_STORAGE_FULL',
+      });
+    }
+  } catch (error) {
+    console.warn(`Output usage check failed: ${error.message}`);
+  }
+
   if (activeJobs >= MAX_CONCURRENT_JOBS) {
     return res.status(503).json({
       error: 'Conversion capacity is full. Please try again later.', errorCode: 'CAPACITY_FULL',
@@ -1013,7 +1231,9 @@ app.post('/api/process-tweet', async (req, res) => {
 
   // Return jobId immediately; process async so the client can stream progress
   const jobId = uuidv4();
-  createJob(jobId);
+  const job = createJob(jobId);
+  job.tweetId = tweetId;
+  inFlightTweets.set(tweetId, jobId);
   activeJobs++;
   res.json({ success: true, jobId });
 
@@ -1025,15 +1245,19 @@ app.post('/api/process-tweet', async (req, res) => {
     let processingPhase = 'setup';
 
     try {
+      assertJobWithinDeadline(jobId);
       await fs.mkdir(sessionDir, { recursive: true });
+      activeSessionDirs.add(sessionDir);
       console.log(`\n── Processing tweet ${tweetId} by @${username} (job ${jobId}) ──`);
 
       // 1. Fetch tweet metadata
       processingPhase = 'oembed';
       emitProgress(jobId, { type: 'step', message: 'Fetching tweet metadata...' });
       const oembedData = await fetchOEmbed(canonicalUrl);
+      assertJobWithinDeadline(jobId);
       const tweetText = extractTweetText(oembedData.html);
-      const authorName = oembedData.author_name || username;
+      const identity = resolveOEmbedIdentity(oembedData, { username, tweetId, canonicalUrl });
+      const authorName = identity.authorName;
       const quoteContext = extractQuoteContext(oembedData.html);
       const quoteContextUnavailable = hasQuoteMarkup(oembedData.html) && !quoteContext;
       const tweetDate = tweetDateFromId(tweetId);
@@ -1043,11 +1267,13 @@ app.post('/api/process-tweet', async (req, res) => {
       // 2. Download video
       processingPhase = 'video';
       emitProgress(jobId, { type: 'step', message: 'Downloading video...' });
+      assertJobWithinDeadline(jobId);
       let videoPath = null;
       let videoInfo = null;
       try {
-        videoPath = await downloadVideoYtDlp(canonicalUrl, sessionDir);
-        videoInfo = await getVideoInfo(videoPath);
+        videoPath = await downloadVideoYtDlp(canonicalUrl, sessionDir, boundedTimeout(job.deadlineAt, 120000));
+        videoInfo = await getVideoInfo(videoPath, boundedTimeout(job.deadlineAt, 15000));
+        assertJobWithinDeadline(jobId);
         console.log(`  Video: ${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s, audio=${videoInfo.hasAudio}`);
       } catch (err) {
         console.warn(`  Video download failed: ${err.message}`);
@@ -1057,10 +1283,11 @@ app.post('/api/process-tweet', async (req, res) => {
 
       // 3. Fetch avatar
       processingPhase = 'avatar';
+      assertJobWithinDeadline(jobId);
       let avatarFileUrl = null;
       try {
         const avatarPath = path.join(sessionDir, 'avatar.jpg');
-        await downloadFile(`https://unavatar.io/twitter/${username}`, avatarPath);
+        await downloadFile(`https://unavatar.io/twitter/${identity.handle}`, avatarPath, boundedTimeout(job.deadlineAt, 10000));
         avatarFileUrl = toFileUrl(avatarPath);
         console.log('  Avatar downloaded');
       } catch (e) {
@@ -1089,7 +1316,7 @@ app.post('/api/process-tweet', async (req, res) => {
       } else if (oembedData.thumbnail_url) {
         try {
           const imgPath = path.join(sessionDir, 'media.jpg');
-          await downloadFile(oembedData.thumbnail_url, imgPath);
+          await downloadFile(oembedData.thumbnail_url, imgPath, boundedTimeout(job.deadlineAt, 10000));
           const imgUrl = toFileUrl(imgPath);
           mediaHtml = `
     <div class="media-wrap">
@@ -1104,61 +1331,67 @@ app.post('/api/process-tweet', async (req, res) => {
       // 6. Render tweet HTML and screenshot (uses warm browser pool)
       processingPhase = 'render';
       emitProgress(jobId, { type: 'step', message: 'Rendering tweet card...' });
+      assertJobWithinDeadline(jobId);
       const htmlContent = renderTweetHtml({
-        authorName, handle: username, tweetText, avatarFileUrl, mediaHtml,
+        authorName, handle: identity.handle, tweetText, avatarFileUrl, mediaHtml,
         cardWidth, tweetDate, quoteContext, quoteContextUnavailable,
       });
       const htmlPath = path.join(sessionDir, 'tweet.html');
       await fs.writeFile(htmlPath, htmlContent, 'utf8');
 
-      const { screenshotPath, videoArea, cardHeight: outputHeight } = await screenshotTweet(htmlPath);
+      const { screenshotPath, videoArea, cardHeight: outputHeight } = await screenshotTweet(htmlPath, boundedTimeout(job.deadlineAt, 30000));
       console.log(`  Screenshot saved. Video area: ${JSON.stringify(videoArea)}`);
 
       // 7. Composite video (rotation applied inline — no pre-encode pass)
       processingPhase = 'composite';
       emitProgress(jobId, { type: 'step', message: 'Compositing video...' });
+      assertJobWithinDeadline(jobId);
       const videoId = uuidv4();
       const outputVideoPath = path.join(outputDir, `${videoId}.mp4`);
       partialOutputs.push(outputVideoPath);
 
       if (videoPath && videoArea) {
         console.log(`Compositing tweet frame with video (audio=${videoInfo.hasAudio}, rotation=${videoInfo.rotation})...`);
-        await compositeVideo(screenshotPath, videoPath, videoArea, outputVideoPath, videoInfo.hasAudio, videoInfo.rotation);
+        await compositeVideo(screenshotPath, videoPath, videoArea, outputVideoPath, videoInfo.hasAudio, videoInfo.rotation, job.deadlineAt);
       } else {
         console.log('Creating static image video (no video in tweet)...');
-        await staticImageToVideo(screenshotPath, outputVideoPath, 5);
+        await staticImageToVideo(screenshotPath, outputVideoPath, 5, job.deadlineAt);
       }
       console.log('  MP4 created');
+      await assertOutputUsageWithinLimit();
 
       // 8. Convert to GIF
       processingPhase = 'gif';
       emitProgress(jobId, { type: 'step', message: 'Creating GIF...' });
+      assertJobWithinDeadline(jobId);
       const gifPath = path.join(outputDir, `${videoId}.gif`);
       partialOutputs.push(gifPath);
       try {
-        await videoToGif(outputVideoPath, gifPath, cardWidth);
+        await videoToGif(outputVideoPath, gifPath, cardWidth, job.deadlineAt);
         console.log('  GIF created');
       } catch (gifErr) {
+        if (/timed out|time limit/i.test(gifErr.message || '')) throw gifErr;
         console.warn(`  GIF palette conversion failed (${gifErr.message}), trying simple conversion...`);
-        const fallbackCommand = ffmpeg(outputVideoPath)
-          .outputOptions([`-vf`, `fps=12,scale=${cardWidth}:-1:flags=lanczos`])
-          .output(gifPath);
-        await runFfmpegCommand(fallbackCommand, { label: 'FFmpeg GIF fallback' });
+        await runFfmpegArgs(['-y', '-i', outputVideoPath, '-vf', `fps=12,scale=${cardWidth}:-1:flags=lanczos`, gifPath], { label: 'FFmpeg GIF fallback', timeoutMs: boundedTimeout(job.deadlineAt, FFMPEG_TIMEOUT_MS) });
         console.log('  GIF created (simple)');
       }
+      await assertOutputUsageWithinLimit();
 
       // 9. Convert to WebM
       processingPhase = 'webm';
       emitProgress(jobId, { type: 'step', message: 'Creating WebM...' });
+      assertJobWithinDeadline(jobId);
       const webmPath = path.join(outputDir, `${videoId}.webm`);
       partialOutputs.push(webmPath);
       try {
-        await videoToWebm(outputVideoPath, webmPath);
+        await videoToWebm(outputVideoPath, webmPath, job.deadlineAt);
         console.log('  WebM created');
       } catch (webmErr) {
+        if (/timed out|time limit/i.test(webmErr.message || '')) throw webmErr;
         await fs.rm(webmPath, { force: true }).catch(() => {});
         console.warn(`  WebM conversion failed: ${webmErr.message}`);
       }
+      await assertOutputUsageWithinLimit();
 
       // Cleanup session temp files
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
@@ -1167,9 +1400,12 @@ app.post('/api/process-tweet', async (req, res) => {
       const metaPath = path.join(outputDir, `${videoId}.json`);
       const staticCard = !(videoPath && videoInfo);
       const resultMetadata = buildResultMetadata({ authorName, staticCard, quoteContext });
-      await fs.writeFile(metaPath, JSON.stringify({
-        tweetUrl: canonicalUrl, width: cardWidth, height: outputHeight, ...resultMetadata,
-      }), 'utf8').catch(() => {});
+      await writeJsonAtomic(metaPath, {
+        tweetId,
+        tweetUrl: identity.tweetUrl || canonicalUrl,
+        handle: identity.handle,
+        width: cardWidth, height: outputHeight, ...resultMetadata,
+      }).catch(() => {});
 
       // Store in cache
       tweetCache.set(tweetId, videoId);
@@ -1187,10 +1423,16 @@ app.post('/api/process-tweet', async (req, res) => {
       console.error('Error processing tweet:', error);
       await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
       await Promise.all(partialOutputs.map(file => fs.rm(file, { force: true }).catch(() => {})));
-      const safeError = classifyProcessingError(error, processingPhase);
+      const timedOut = !!(job && job.deadlineAt && Date.now() >= job.deadlineAt) || !!(error && /processing time limit/i.test(error.message));
+      const safeError = classifyProcessingError(error, timedOut ? 'timeout' : processingPhase);
       rejectJob(jobId, safeError.message, safeError.errorCode);
     } finally {
-      activeJobs = Math.max(0, activeJobs - 1);
+      if (inFlightTweets.get(tweetId) === jobId) inFlightTweets.delete(tweetId);
+      activeSessionDirs.delete(sessionDir);
+      if (job.active) {
+        job.active = false;
+        if (job.generation === serverGeneration) activeJobs = Math.max(0, activeJobs - 1);
+      }
     }
   })();
 });
@@ -1282,18 +1524,22 @@ app.get('/share/:videoId', async (req, res) => {
   const ogDescription = staticCard ? 'Shareable tweet card' : 'Shareable tweet video with audio';
   const safeShareUrl = escapeHtml(shareUrl);
   const safeFileUrl = escapeHtml(fileUrl);
+  const embedFileUrl = isVideo && mp4Exists ? mp4Url : fileUrl;
+  const embedMimeType = isVideo && mp4Exists ? 'video/mp4' : mimeType;
+  const safeEmbedFileUrl = escapeHtml(embedFileUrl);
+  const safeEmbedMimeType = escapeHtml(embedMimeType);
   const safeThumbUrl = thumbUrl ? escapeHtml(thumbUrl) : null;
   const safeTweetUrl = tweetUrl && parseTweetUrl(tweetUrl) ? escapeHtml(parseTweetUrl(tweetUrl).canonicalUrl) : null;
-  const safeMimeType = escapeHtml(mimeType);
   const safeDescription = escapeHtml(ogDescription);
   const safeWidth = escapeHtml(outputWidth);
   const safeHeight = escapeHtml(outputHeight);
   const twitterCard = isVideo ? 'player' : 'summary_large_image';
 
   const html = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${ogTitle}</title>
   <link rel="canonical" href="${safeShareUrl}" />
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
@@ -1308,17 +1554,17 @@ app.get('/share/:videoId', async (req, res) => {
   <meta name="twitter:description" content="${safeDescription}" />
   ${safeThumbUrl ? `<meta name="twitter:image" content="${safeThumbUrl}" />` : ''}
   ${isVideo ? `
-  <meta property="og:video" content="${safeFileUrl}" />
-  <meta property="og:video:url" content="${safeFileUrl}" />
-  <meta property="og:video:secure_url" content="${safeFileUrl}" />
-  <meta property="og:video:type" content="${safeMimeType}" />
+  <meta property="og:video" content="${safeEmbedFileUrl}" />
+  <meta property="og:video:url" content="${safeEmbedFileUrl}" />
+  <meta property="og:video:secure_url" content="${safeEmbedFileUrl}" />
+  <meta property="og:video:type" content="${safeEmbedMimeType}" />
   <meta property="og:video:width" content="${safeWidth}" />
   <meta property="og:video:height" content="${safeHeight}" />
   <meta name="twitter:player" content="${safeShareUrl}" />
   <meta name="twitter:player:width" content="${safeWidth}" />
   <meta name="twitter:player:height" content="${safeHeight}" />
-  <meta name="twitter:player:stream" content="${safeFileUrl}" />
-  <meta name="twitter:player:stream:content_type" content="${safeMimeType}" />
+  <meta name="twitter:player:stream" content="${safeEmbedFileUrl}" />
+  <meta name="twitter:player:stream:content_type" content="${safeEmbedMimeType}" />
   ` : ''}
 </head>
 <body>
@@ -1336,7 +1582,77 @@ app.get('/share/:videoId', async (req, res) => {
   res.send(html);
 });
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+async function getReadiness() {
+  const issues = [];
+  const warnings = [];
+  const configuredBrowser = process.env.PUPPETEER_EXECUTABLE_PATH;
+  let browserPath = configuredBrowser;
+  if (!browserPath) {
+    try { browserPath = await puppeteer.executablePath(); } catch { browserPath = null; }
+  }
+  if (!browserPath || !fsSync.existsSync(browserPath)) issues.push('browser-unavailable');
+  const ffmpegAvailable = (ffmpegPath && fsSync.existsSync(ffmpegPath)) || (() => {
+    try { execFileSync('ffmpeg', ['-version'], { stdio: 'ignore', timeout: 2000 }); return true; } catch { return false; }
+  })();
+  if (!ffmpegAvailable) issues.push('ffmpeg-unavailable');
+  if (!YT_DLP) warnings.push('yt-dlp-unavailable');
+  if (browserLastError && !_browser) issues.push('browser-start-failed');
+  return { ready: issues.length === 0, issues, warnings };
+}
+
+async function sendReadiness(res) {
+  const readiness = await getReadiness();
+  return res.status(readiness.ready ? 200 : 503).json({
+    status: readiness.ready ? 'ok' : 'degraded',
+    ready: readiness.ready,
+    issues: readiness.issues,
+    warnings: readiness.warnings,
+  });
+}
+
+// Run FFmpeg directly. fluent-ffmpeg is deprecated, so keeping the small
+// argument builder here avoids an unmaintained command wrapper in production.
+function runFfmpegArgs(args, options = {}) {
+  const { label = 'FFmpeg conversion', timeoutMs = FFMPEG_TIMEOUT_MS, onStart, onStderr } = options;
+  const ffmpegBin = ffmpegPath && fsSync.existsSync(ffmpegPath) ? ffmpegPath : 'ffmpeg';
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stderr = '';
+    let timer = null;
+    let proc = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (proc) activeProcesses.delete(proc);
+      fn(value);
+    };
+    try {
+      proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      activeProcesses.add(proc);
+      onStart?.([ffmpegBin, ...args].join(' '));
+      proc.stderr.on('data', chunk => {
+        const text = chunk.toString();
+        stderr = (stderr + text).slice(-8192);
+        for (const line of text.split(/\r?\n/)) if (line) onStderr?.(line);
+      });
+      proc.once('error', error => finish(reject, error));
+      proc.once('close', code => {
+        if (code === 0) return finish(resolve);
+        finish(reject, new Error(`${label} failed with exit code ${code}: ${stderr.slice(-500)}`));
+      });
+      timer = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch {}
+        finish(reject, new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
+app.get('/api/health', (req, res, next) => sendReadiness(res).catch(next));
+app.get('/api/ready', (req, res, next) => sendReadiness(res).catch(next));
 
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large' });
@@ -1357,17 +1673,21 @@ function clearLifecycleTimers() {
 
 async function startServer(options = {}) {
   if (httpServer) return httpServer;
+  serverGeneration++;
+  serverStopping = false;
+  browserLastError = null;
   await ensureDirectories();
+  await hydrateTweetCache();
 
   // Pre-warm browser so first request doesn't pay the launch cost
   if (options.prewarm !== false) getBrowser().catch(e => console.warn('Browser pre-warm failed:', e.message));
 
-  // Auto-cleanup: remove output files older than 24 hours
-  cleanOldOutputs();
-  cleanupTimer = setInterval(() => cleanOldOutputs(), 3_600_000);
+  // Auto-cleanup: remove output files older than 24 hours before accepting work.
+  await cleanOldOutputs();
+  await cleanOldTempDirs();
+  cleanupTimer = setInterval(() => { cleanOldOutputs(); cleanOldTempDirs(); }, 3_600_000);
   jobTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [id, job] of jobs) if (job.expiresAt <= now && job.clients.length === 0) jobs.delete(id);
+    pruneExpiredJobs();
   }, Math.min(JOB_TTL_MS, 60_000));
 
   const port = options.port ?? PORT;
@@ -1393,8 +1713,13 @@ async function startServer(options = {}) {
 }
 
 async function stopServer() {
+  serverStopping = true;
+  serverGeneration++;
+  inFlightTweets.clear();
   clearLifecycleTimers();
+  activeJobs = 0;
   for (const job of jobs.values()) {
+    job.active = false;
     for (const client of job.clients) {
       try { client.end(); } catch {}
     }
@@ -1407,8 +1732,15 @@ async function stopServer() {
     if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     await closed;
   }
+  for (const process of activeProcesses) {
+    try { process.kill('SIGKILL'); } catch {}
+  }
+  activeProcesses.clear();
+  if (browserLaunch) await browserLaunch.catch(() => {});
   if (_browser) await _browser.close().catch(() => {});
   _browser = null;
+  browserLaunch = null;
+  browserLastError = null;
 }
 
 if (require.main === module) {
@@ -1424,9 +1756,21 @@ module.exports = {
   stopServer,
   _internals: {
     runFfmpegCommand,
+    runFfmpegArgs,
+    compositeVideo,
+    staticImageToVideo,
+    videoToGif,
+    videoToWebm,
     isNoVideoDownloadError,
+    buildYtDlpArgs,
+    parseVideoInfoOutput,
+    rotationFilterFor,
+    toFileUrl,
+    resolveOEmbedIdentity,
     PIPELINE_STAGES,
     createJob,
+    jobs,
+    pruneExpiredJobs,
     emitProgress,
     classifyProcessingError,
     extractQuoteContext,

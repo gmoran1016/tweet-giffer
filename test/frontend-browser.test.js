@@ -140,3 +140,58 @@ test('retryable conversion errors preserve the URL and expose retry', { skip: !b
     await page.close();
   }
 });
+
+test('switching preview tabs pauses inactive media', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => displayResults({
+      videoId: 'a23e4567-e89b-42d3-a456-426614174000',
+      gif: '/outputs/a23e4567-e89b-42d3-a456-426614174000.gif',
+      video: '/outputs/a23e4567-e89b-42d3-a456-426614174000.mp4',
+      webm: '/outputs/a23e4567-e89b-42d3-a456-426614174000.webm',
+    }));
+    const calls = await page.evaluate(() => {
+      let count = 0;
+      document.getElementById('videoPlayer').pause = () => { count += 1; };
+      document.getElementById('webmPlayer').pause = () => { count += 1; };
+      selectTab(document.getElementById('videoTab'));
+      selectTab(document.getElementById('gifTab'));
+      return count;
+    });
+    assert.equal(calls, 4);
+  } finally {
+    await page.close();
+  }
+});
+
+test('a transient status request is retried without losing the active job', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  const jobId = 'b23e4567-e89b-42d3-a456-426614174000';
+  try {
+    let statusCalls = 0;
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (request.url().endsWith('/api/process-tweet')) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, jobId }) });
+      }
+      if (request.url().includes(`/api/status/${jobId}`)) {
+        statusCalls += 1;
+        if (statusCalls === 1) return request.abort('connectionfailed');
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({
+          jobId, done: true, error: null, errorCode: null,
+          result: { videoId: 'c23e4567-e89b-42d3-a456-426614174000', gif: '/outputs/c23e4567-e89b-42d3-a456-426614174000.gif', video: '/outputs/c23e4567-e89b-42d3-a456-426614174000.mp4', webm: null },
+        }) });
+      }
+      return request.continue();
+    });
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.type('#tweetUrl', 'https://x.com/alice/status/123456789');
+    await page.click('#processBtn');
+    await page.waitForFunction(() => !document.getElementById('resultSection').classList.contains('hidden'), { timeout: 5000 });
+    assert.equal(statusCalls, 2);
+    assert.equal(await page.evaluate(() => localStorage.getItem('tweetGiffer.activeJob')), null);
+  } finally {
+    await page.close();
+  }
+});

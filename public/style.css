@@ -221,8 +221,8 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
 }
 
 .tab-btn.active {
-  color: #1da1f2;
-  border-bottom-color: #1da1f2;
+  color: var(--accent);
+  border-bottom-color: var(--accent);
   background: #f7f9fa;
 }
 
@@ -276,7 +276,11 @@ button:disabled, select:disabled { opacity: 0.62; cursor: not-allowed; transform
   color: var(--accent);
   background: white;
   cursor: pointer;
-  outline: none;
+}
+
+.share-select:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
 }
 
 .share-group .btn-secondary {

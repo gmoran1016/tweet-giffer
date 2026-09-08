@@ -26,10 +26,10 @@ const webmOption = shareFormat.querySelector('option[value="webm"]');
 
 const ALLOWED_HOSTNAMES = new Set(['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com']);
 const POLL_INTERVAL_MS = 2000;
-const POLL_DEADLINE_MS = 5 * 60 * 1000;
+const POLL_DEADLINE_MS = 15 * 60 * 1000;
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ACTIVE_JOB_STORAGE_KEY = 'tweetGiffer.activeJob';
-const RETRYABLE_ERROR_CODES = new Set(['CAPACITY_FULL', 'MEDIA_ACCESS_FAILED', 'PROCESSING_FAILED']);
+const RETRYABLE_ERROR_CODES = new Set(['CAPACITY_FULL', 'MEDIA_ACCESS_FAILED', 'PROCESSING_FAILED', 'PROCESSING_TIMEOUT', 'POLL_NETWORK']);
 let currentResult = null;
 let activeRun = null;
 let shareTimer = null;
@@ -95,6 +95,7 @@ function stopElapsedTimer() {
 
 function selectTab(tab, focus = false) {
   if (!tab || tab.hidden) return;
+  [videoPlayer, webmPlayer].forEach(player => { try { player.pause(); } catch {} });
   tabButtons.forEach((button) => {
     const selected = button === tab;
     button.classList.toggle('active', selected);
@@ -151,14 +152,42 @@ function waitForNextPoll(run) {
   });
 }
 
+function waitForRetry(run, milliseconds) {
+  return new Promise((resolve, reject) => {
+    const { signal } = run.controller;
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, milliseconds);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function fetchStatusWithRetry(jobId, run) {
+  let failures = 0;
+  while (true) {
+    try {
+      const response = await fetch(`/api/status/${encodeURIComponent(jobId)}`, { signal: run.controller.signal, headers: { Accept: 'application/json' } });
+      return await readJsonResponse(response, 'Lost connection to server. Please try again.');
+    } catch (error) {
+      if (run.controller.signal.aborted || error.code || error.name === 'AbortError') throw error;
+      failures++;
+      if (failures > 3) {
+        error.retryable = true;
+        error.code = 'POLL_NETWORK';
+        throw error;
+      }
+      if (activeRun === run) loadingStatus.textContent = 'Connection interrupted. Retrying...';
+      await waitForRetry(run, Math.min(1000, 250 * failures));
+    }
+  }
+}
+
 async function pollForResult(jobId, run, immediate = false) {
   if (!jobId || typeof jobId !== 'string') throw new Error('Server returned an invalid job response.');
   let firstPoll = true;
   while (Date.now() < run.deadline) {
     if (!immediate || !firstPoll) await waitForNextPoll(run);
     firstPoll = false;
-    const response = await fetch(`/api/status/${encodeURIComponent(jobId)}`, { signal: run.controller.signal, headers: { Accept: 'application/json' } });
-    const status = await readJsonResponse(response, 'Lost connection to server. Please try again.');
+    const status = await fetchStatusWithRetry(jobId, run);
     if (typeof status.error === 'string') throw createApiError(status.error, status.errorCode);
     if (status.done) {
       if (!status.result || typeof status.result !== 'object') throw new Error('Server returned an invalid result.');
@@ -169,7 +198,9 @@ async function pollForResult(jobId, run, immediate = false) {
       if (Number.isFinite(status.elapsedMs) && !elapsedTimer) loadingElapsed.textContent = `Elapsed ${formatElapsed(status.elapsedMs)}.`;
     }
   }
-  throw new Error('Processing timed out after five minutes. Please try again.');
+  const timeout = createApiError('Processing timed out after fifteen minutes. Please try again.', 'PROCESSING_TIMEOUT');
+  timeout.name = 'TimeoutError';
+  throw timeout;
 }
 
 function clearMedia() {
@@ -211,7 +242,7 @@ tweetForm.addEventListener('submit', async (event) => {
     jobId: null,
   };
   activeRun = run;
-  run.deadlineTimer = setTimeout(() => run.controller.abort(new DOMException('Processing timed out after five minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
+  run.deadlineTimer = setTimeout(() => run.controller.abort(new DOMException('Processing timed out after fifteen minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
   showLoading('Starting conversion...');
   startElapsedTimer(run);
   processBtn.disabled = true;
@@ -238,7 +269,7 @@ tweetForm.addEventListener('submit', async (event) => {
       const message = error.name === 'TimeoutError' ? error.message :
         error.name === 'AbortError' ? 'Processing was cancelled. Please try again.' : error.message;
       showError(message || 'Failed to process tweet. Please try again.', error.code);
-      clearStoredJob();
+      if (!error.retryable) clearStoredJob();
     }
   } finally {
     clearTimeout(run.deadlineTimer); clearTimeout(run.pollTimer);
@@ -380,7 +411,7 @@ async function restoreActiveJob() {
     jobId: stored.jobId,
   };
   activeRun = run;
-  run.deadlineTimer = setTimeout(() => run.controller.abort(new DOMException('Processing timed out after five minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
+  run.deadlineTimer = setTimeout(() => run.controller.abort(new DOMException('Processing timed out after fifteen minutes. Please try again.', 'TimeoutError')), POLL_DEADLINE_MS);
   processBtn.disabled = true;
   processBtn.textContent = 'Processing...';
   showLoading('Resuming conversion...', { elapsedMs: Math.max(0, Date.now() - stored.startedAt) });

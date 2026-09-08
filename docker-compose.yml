@@ -8,20 +8,24 @@ services:
       PORT: ${PORT:-3000}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       TRUST_PROXY: ${TRUST_PROXY:-false}
+      TRUST_PROXY_IPS: ${TRUST_PROXY_IPS:-127.0.0.1,::1}
       ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-2}
-      # Refresh yt-dlp on container start so Twitter/X extraction keeps working.
-      # Set to false on air-gapped hosts to skip the update.
-      YTDLP_UPDATE: ${YTDLP_UPDATE:-true}
+      MAX_DOWNLOAD_BYTES: ${MAX_DOWNLOAD_BYTES:-209715200}
+      MAX_VIDEO_DURATION_SEC: ${MAX_VIDEO_DURATION_SEC:-600}
+      MAX_VIDEO_DIMENSION: ${MAX_VIDEO_DIMENSION:-4096}
+      MAX_OUTPUT_BYTES: ${MAX_OUTPUT_BYTES:-5368709120}
+      MAX_REMOTE_MEDIA_BYTES: ${MAX_REMOTE_MEDIA_BYTES:-10485760}
+      JOB_TIMEOUT_MS: ${JOB_TIMEOUT_MS:-900000}
     volumes:
       # Persist generated outputs between container restarts
       - ./outputs:/app/outputs
     tmpfs:
-      - /app/temp:mode=1770,uid=1000,gid=1000
+      - /app/temp:mode=1770,uid=1000,gid=1000,size=1g,noexec,nosuid
     restart: unless-stopped
     shm_size: 256mb   # Chromium needs extra shared memory
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:$${PORT:-3000}/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:$${PORT:-3000}/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 5s
       start_period: 20s

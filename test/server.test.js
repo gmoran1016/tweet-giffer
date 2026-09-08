@@ -287,7 +287,7 @@ test('share emits Discord-friendly canonical video metadata', async () => {
   }
 });
 
-test('share emits one canonical video metadata set for WebM', async () => {
+test('WebM share uses MP4 metadata fallback for Discord when MP4 exists', async () => {
   const id = '623e4567-e89b-42d3-a456-426614174000';
   await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.mp4`), 'media');
   await fs.writeFile(path.join(process.env.OUTPUT_DIR, `${id}.gif`), 'image');
@@ -301,8 +301,10 @@ test('share emits one canonical video metadata set for WebM', async () => {
     const html = await response.text();
     assert.equal(response.status, 200);
     assert.equal((html.match(/<meta property="og:video"/g) || []).length, 1);
-    assert.match(html, /<meta property="og:video:type" content="video\/webm" \/>/);
-    assert.doesNotMatch(html, new RegExp(`${id}\\.mp4"`));
+    assert.match(html, /<meta property="og:video:type" content="video\/mp4" \/>/);
+    assert.match(html, new RegExp(`<meta property="og:video" content="https://giffer\\.example\\.test/outputs/${id}\\.mp4" />`));
+    assert.match(html, new RegExp(`<meta name="twitter:player:stream" content="https://giffer\\.example\\.test/outputs/${id}\\.mp4" />`));
+    assert.match(html, new RegExp(`<video src="https://giffer\\.example\\.test/outputs/${id}\\.webm"`));
   } finally {
     delete process.env.PUBLIC_BASE_URL;
   }
@@ -408,8 +410,66 @@ test('distinguishes tweets without video from yt-dlp failures', () => {
   const { isNoVideoDownloadError } = require('../server')._internals;
 
   assert.equal(isNoVideoDownloadError(new Error('ERROR: [Twitter] 123: No video formats found!')), true);
+  assert.equal(isNoVideoDownloadError(new Error('ERROR: [twitter] 123: No video could be found in this tweet')), true);
   assert.equal(isNoVideoDownloadError(new Error('yt-dlp is not installed. Run: pip install yt-dlp')), false);
   assert.equal(isNoVideoDownloadError(new Error('yt-dlp failed (code 1): HTTP Error 403: Forbidden')), false);
+});
+
+test('yt-dlp arguments stay on Twitter extractors and enforce bounded downloads', () => {
+  const { buildYtDlpArgs } = require('../server')._internals;
+  const args = buildYtDlpArgs('https://x.com/alice/status/123', 'C:\\temp\\session');
+  assert.deepEqual(args.slice(0, 3), [
+    'https://x.com/alice/status/123', '-o', 'C:\\temp\\session\\video.%(ext)s',
+  ]);
+  assert.ok(args.includes('--ignore-config'));
+  assert.deepEqual(args.slice(args.indexOf('--use-extractors'), args.indexOf('--use-extractors') + 2), ['--use-extractors', 'twitter']);
+  assert.ok(args.includes('--max-filesize'));
+  assert.ok(args.includes('--match-filter'));
+  assert.deepEqual(args.slice(args.indexOf('--max-downloads'), args.indexOf('--max-downloads') + 2), ['--max-downloads', '1']);
+});
+
+test('video metadata parsing accepts small dimensions and maps display rotation correctly', () => {
+  const { parseVideoInfoOutput, rotationFilterFor } = require('../server')._internals;
+  const parsed = parseVideoInfoOutput([
+    'Duration: 00:00:02.50, start: 0.000000, bitrate: 100 kb/s',
+    'Stream #0:0: Video: h264, 96x160 [SAR 1:1 DAR 3:5]',
+    'Stream #0:1: Audio: aac, 44100 Hz',
+    'rotate          : 90',
+  ].join('\n'));
+  assert.deepEqual(parsed, { width: 160, height: 96, duration: 2.5, hasAudio: true, rotation: 90 });
+  assert.equal(rotationFilterFor(90), 'transpose=2,');
+  assert.equal(rotationFilterFor(270), 'transpose=1,');
+  assert.equal(rotationFilterFor(180), 'vflip,hflip,');
+});
+
+test('file URLs encode path characters and upstream identity overrides submitted usernames', () => {
+  const { toFileUrl, resolveOEmbedIdentity } = require('../server')._internals;
+  const fileUrl = toFileUrl('C:\\audit #fixture\\tweet.html');
+  assert.match(fileUrl, /^file:\/\/\/C:\/audit%20%23fixture\/tweet\.html$/);
+  assert.deepEqual(resolveOEmbedIdentity({
+    author_name: 'Captain America',
+    author_url: 'https://x.com/CaptainAmerica',
+    url: 'https://x.com/CaptainAmerica/status/123',
+  }, {
+    username: 'audit_wrong', tweetId: '123', canonicalUrl: 'https://x.com/audit_wrong/status/123',
+  }), {
+    authorName: 'Captain America',
+    handle: 'CaptainAmerica',
+    tweetUrl: 'https://x.com/CaptainAmerica/status/123',
+  });
+});
+
+test('pending jobs are retained while completed jobs expire', () => {
+  const { createJob, jobs, pruneExpiredJobs } = require('../server')._internals;
+  const id = '733e4567-e89b-42d3-a456-426614174000';
+  const job = createJob(id);
+  job.expiresAt = Date.now() - 1;
+  pruneExpiredJobs(Date.now());
+  assert.equal(jobs.has(id), true);
+  job.completedAt = Date.now() - 10;
+  job.expiresAt = Date.now() - 1;
+  pruneExpiredJobs(Date.now());
+  assert.equal(jobs.has(id), false);
 });
 
 test('stopServer closes active SSE clients and settles promptly', async () => {

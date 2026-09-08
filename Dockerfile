@@ -24,12 +24,12 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     ca-certificates \
-    gosu \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp
-RUN pip3 install yt-dlp --break-system-packages
+# Install a build-time-pinned yt-dlp. Runtime startup must remain offline and immutable.
+ARG YTDLP_VERSION=2026.03.17
+RUN pip3 install --no-cache-dir "yt-dlp==${YTDLP_VERSION}" --break-system-packages
 
 # Tell Puppeteer to use the system Chromium instead of downloading its own
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
@@ -54,11 +54,10 @@ RUN mkdir -p outputs temp \
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:${PORT:-3000}/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:${PORT:-3000}/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-# Runs as root only long enough to refresh yt-dlp, then drops to the unprivileged
-# node user via gosu (see docker-entrypoint.sh). If started with --user, it stays
-# unprivileged and skips the update.
+# Keep the service unprivileged. The image already contains the pinned runtime tools.
+USER node
 ENTRYPOINT ["./docker-entrypoint.sh"]
 
 CMD ["node", "server.js"]

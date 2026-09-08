@@ -17,4 +17,7 @@ test('frontend declares the usability audit structure and favicon', () => {
 test('frontend declares the accessible accent and focus scroll margin', () => {
   assert.match(styleCss, /--accent:\s*#0b6ca8/i);
   assert.match(styleCss, /scroll-margin-top/);
+  assert.match(styleCss, /\.share-select:focus-visible/);
+  assert.doesNotMatch(styleCss, /\.share-select\s*\{[^}]*outline:\s*none/i);
+  assert.match(styleCss, /\.tab-btn\.active\s*\{[^}]*color:\s*var\(--accent\)/s);
 });

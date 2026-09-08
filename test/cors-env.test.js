@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
@@ -14,12 +16,15 @@ const serverScript = `
 `;
 
 async function corsHeaderFor(env, origin) {
+  const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'tweet-giffer-cors-'));
   const child = spawn(process.execPath, ['-e', serverScript], {
     cwd: path.resolve(__dirname, '..'),
     env: {
       ...process.env,
       ALLOWED_ORIGIN: '',
       CORS_ORIGIN: '',
+      OUTPUT_DIR: path.join(testRoot, 'outputs'),
+      TEMP_DIR: path.join(testRoot, 'temp'),
       ...env,
     },
     stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
@@ -47,6 +52,7 @@ async function corsHeaderFor(env, origin) {
       child.once('exit', resolve);
       setTimeout(() => { child.kill(); resolve(); }, 5_000).unref();
     });
+    await fs.rm(testRoot, { recursive: true, force: true });
   }
 }
 
