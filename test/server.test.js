@@ -42,6 +42,16 @@ test('classifies upstream access failures without exposing diagnostics', () => {
   assert.doesNotMatch(JSON.stringify(classifyProcessingError(new Error('private stderr'))), /private|stderr/i);
 });
 
+test('builds oEmbed requests against the current X publishing host', () => {
+  const { buildOEmbedUrl } = require('../server')._internals;
+  const requestUrl = new URL(buildOEmbedUrl('https://x.com/MLB/status/2097762182364581908'));
+
+  assert.equal(requestUrl.origin, 'https://publish.x.com');
+  assert.equal(requestUrl.pathname, '/oembed');
+  assert.equal(requestUrl.searchParams.get('url'), 'https://x.com/MLB/status/2097762182364581908');
+  assert.equal(requestUrl.searchParams.get('omit_script'), 'true');
+});
+
 test('extracts nested quote context without inventing flat-post context', () => {
   const { extractQuoteContext } = require('../server')._internals;
   const html = `

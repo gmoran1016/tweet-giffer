@@ -455,8 +455,12 @@ function tweetDateFromId(tweetId) {
 }
 
 // Fetch tweet metadata via oEmbed (no auth required)
+function buildOEmbedUrl(tweetUrl) {
+  return `https://publish.x.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`;
+}
+
 async function fetchOEmbed(tweetUrl) {
-  const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`;
+  const oembedUrl = buildOEmbedUrl(tweetUrl);
   const response = await axios.get(oembedUrl, {
     timeout: 15000,
     maxContentLength: MAX_REMOTE_MEDIA_BYTES,
@@ -1767,6 +1771,7 @@ module.exports = {
     rotationFilterFor,
     toFileUrl,
     resolveOEmbedIdentity,
+    buildOEmbedUrl,
     PIPELINE_STAGES,
     createJob,
     jobs,
