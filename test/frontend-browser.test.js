@@ -198,3 +198,179 @@ test('a transient status request is retried without losing the active job', { sk
     await page.close();
   }
 });
+
+test('invalid URLs expose an associated inline field error', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.type('#tweetUrl', 'https://example.com/status/123');
+    await page.click('#processBtn');
+    await page.waitForFunction(() => !document.getElementById('urlError').classList.contains('hidden'), { timeout: 1000 });
+    const state = await page.evaluate(() => {
+      const input = document.getElementById('tweetUrl');
+      const error = document.getElementById('urlError');
+      return {
+        invalid: input.getAttribute('aria-invalid'),
+        describedBy: input.getAttribute('aria-describedby'),
+        visible: !error.classList.contains('hidden'),
+        message: error.textContent,
+        focused: document.activeElement === input,
+        globalHidden: document.getElementById('errorSection').classList.contains('hidden'),
+      };
+    });
+    assert.equal(state.invalid, 'true');
+    assert.match(state.describedBy, /urlError/);
+    assert.equal(state.visible, true);
+    assert.match(state.message, /twitter\.com or x\.com/i);
+    assert.equal(state.focused, true);
+    assert.equal(state.globalHidden, true);
+  } finally {
+    await page.close();
+  }
+});
+
+test('loading progress marks completed and active stages', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => showLoading({ stepIndex: 6, stepCount: 6, elapsedMs: 12500 }));
+    const state = await page.evaluate(() => ({
+      active: document.querySelector('[data-progress-step="6"]').getAttribute('aria-current'),
+      completed: [...document.querySelectorAll('[data-progress-step]')].slice(0, 5).every(item => item.dataset.state === 'complete'),
+      status: document.getElementById('loadingStatus').textContent,
+      elapsed: document.getElementById('loadingElapsed').textContent,
+    }));
+    assert.equal(state.active, 'step');
+    assert.equal(state.completed, true);
+    assert.match(state.status, /Step 6 of 6/);
+    assert.match(state.elapsed, /12s/);
+  } finally {
+    await page.close();
+  }
+});
+
+test('copy failure exposes a selectable share URL', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => {
+      displayResults({
+        videoId: 'c23e4567-e89b-42d3-a456-426614174000',
+        gif: '/outputs/c23e4567-e89b-42d3-a456-426614174000.gif',
+        video: '/outputs/c23e4567-e89b-42d3-a456-426614174000.mp4',
+        webm: '/outputs/c23e4567-e89b-42d3-a456-426614174000.webm',
+      });
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async () => { throw new Error('clipboard blocked'); } },
+      });
+      document.execCommand = () => false;
+    });
+    await page.click('#copyLinkBtn');
+    await page.waitForFunction(() => {
+      const field = document.getElementById('manualShareField');
+      return field && !field.classList.contains('hidden');
+    }, { timeout: 1000 });
+    const state = await page.evaluate(() => ({
+      visible: !document.getElementById('manualShareField').classList.contains('hidden'),
+      readonly: document.getElementById('shareUrlInput').readOnly,
+      value: document.getElementById('shareUrlInput').value,
+    }));
+    assert.equal(state.visible, true);
+    assert.equal(state.readonly, true);
+    assert.match(state.value, /\/share\/c23e4567-e89b-42d3-a456-426614174000\?f=gif$/);
+  } finally {
+    await page.close();
+  }
+});
+
+test('missing clipboard support exposes the same selectable share URL fallback', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => {
+      displayResults({
+        videoId: 'f23e4567-e89b-42d3-a456-426614174000',
+        gif: '/outputs/f23e4567-e89b-42d3-a456-426614174000.gif',
+        video: '/outputs/f23e4567-e89b-42d3-a456-426614174000.mp4',
+        webm: null,
+      });
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+      document.execCommand = () => false;
+    });
+    await page.click('#copyLinkBtn');
+    await page.waitForFunction(() => !document.getElementById('manualShareField').classList.contains('hidden'), { timeout: 1000 });
+    assert.match(await page.$eval('#shareUrlInput', input => input.value), /\/share\/f23e4567-e89b-42d3-a456-426614174000\?f=gif$/);
+  } finally {
+    await page.close();
+  }
+});
+
+test('mobile homepage has no horizontal overflow', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.setViewport({ width: 390, height: 844 });
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    const state = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+      buttonHeight: document.getElementById('processBtn').getBoundingClientRect().height,
+      buttonBottom: document.getElementById('processBtn').getBoundingClientRect().bottom,
+    }));
+    assert.equal(state.scrollWidth, state.viewportWidth);
+    assert.equal(state.viewportWidth, 390);
+    assert.ok(state.buttonHeight >= 44);
+    assert.ok(state.buttonBottom <= 844);
+  } finally {
+    await page.close();
+  }
+});
+
+test('result actions preserve hierarchy and remain usable on mobile', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.setViewport({ width: 390, height: 844 });
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    await page.evaluate(() => displayResults({
+      videoId: 'd23e4567-e89b-42d3-a456-426614174000',
+      gif: '/outputs/d23e4567-e89b-42d3-a456-426614174000.gif',
+      video: '/outputs/d23e4567-e89b-42d3-a456-426614174000.mp4',
+      webm: '/outputs/d23e4567-e89b-42d3-a456-426614174000.webm',
+    }));
+    const state = await page.evaluate(() => ({
+      videoPrimary: document.getElementById('downloadVideoBtn').classList.contains('btn-primary'),
+      gifVisible: !document.getElementById('downloadGifBtn').hidden,
+      webmVisible: !document.getElementById('downloadWebmBtn').hidden,
+      shareUsable: document.querySelector('.share-group').getBoundingClientRect().width > 0,
+      overflow: document.documentElement.scrollWidth > window.innerWidth,
+      videoHeight: document.getElementById('downloadVideoBtn').getBoundingClientRect().height,
+    }));
+    assert.equal(state.videoPrimary, true);
+    assert.equal(state.gifVisible, true);
+    assert.equal(state.webmVisible, true);
+    assert.equal(state.shareUsable, true);
+    assert.equal(state.overflow, false);
+    assert.ok(state.videoHeight >= 44);
+  } finally {
+    await page.setViewport({ width: 800, height: 600 });
+    await page.close();
+  }
+});
+
+test('reduced motion loads without application console errors', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  const consoleIssues = [];
+  page.on('console', message => {
+    if (message.type() === 'error' || message.type() === 'warning') consoleIssues.push(message.text());
+  });
+  page.on('pageerror', error => consoleIssues.push(error.message));
+  try {
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+    const animationName = await page.$eval('.container', element => getComputedStyle(element).animationName);
+    assert.equal(animationName, 'none');
+    assert.deepEqual(consoleIssues, []);
+  } finally {
+    await page.close();
+  }
+});

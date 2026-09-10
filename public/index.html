@@ -3,6 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Turn public X posts into shareable GIF, MP4, and WebM motion cards.">
+  <meta name="theme-color" content="#f2eee6">
+  <meta property="og:title" content="Tweet Giffer">
+  <meta property="og:description" content="Turn public posts into shareable motion cards.">
+  <meta property="og:image" content="/social-card.svg">
+  <meta name="twitter:card" content="summary_large_image">
   <title>Tweet Giffer - Convert Tweets to GIFs/Videos</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
@@ -10,37 +16,75 @@
 <body>
   <a class="skip-link" href="#mainContent">Skip to main content</a>
   <div class="container">
-    <header>
-      <h1>🐦 Tweet Giffer</h1>
-      <p class="subtitle">Convert Twitter/X tweets into shareable GIFs and videos</p>
+    <header class="brand-header">
+      <div class="brand-lockup">
+        <img class="brand-mark" src="/favicon.svg" alt="" width="48" height="48">
+        <div>
+          <p class="eyebrow">Media utility</p>
+          <h1>Tweet Giffer</h1>
+        </div>
+      </div>
+      <p class="subtitle">Turn a public X post into a shareable motion card.</p>
     </header>
 
     <main id="mainContent" tabindex="-1">
-      <section class="input-section" aria-labelledby="formHeading">
-        <h2 id="formHeading" class="visually-hidden">Create media from a tweet</h2>
-        <form id="tweetForm" novalidate>
-          <label for="tweetUrl">Twitter or X post URL</label>
-          <div class="input-group">
-            <input type="url" id="tweetUrl" name="tweetUrl"
-              placeholder="https://x.com/username/status/123456"
-              autocomplete="url" autocorrect="off" autocapitalize="off" spellcheck="false"
-              aria-describedby="urlHint" required>
-            <button type="submit" id="processBtn" class="btn-primary">Create GIF/Video</button>
-          </div>
-          <p id="urlHint" class="field-hint">Paste a post URL from twitter.com, www.twitter.com, x.com, or www.x.com.</p>
-        </form>
-      </section>
+      <div class="workspace-grid">
+        <section class="intro-panel" aria-labelledby="introHeading">
+          <p class="eyebrow">A calmer way to share</p>
+          <h2 id="introHeading">Make the moment portable.</h2>
+          <p class="intro-copy">Paste a public post and get a polished card you can save, send, or drop into a conversation.</p>
+          <ul class="feature-list">
+            <li><span class="feature-marker" aria-hidden="true">01</span><span>GIF, MP4, or WebM</span></li>
+            <li><span class="feature-marker" aria-hidden="true">02</span><span>Audio stays with video formats</span></li>
+            <li><span class="feature-marker" aria-hidden="true">03</span><span>Files are removed after 24 hours</span></li>
+          </ul>
+        </section>
+
+        <section class="input-section tool-panel" aria-labelledby="formHeading">
+          <p class="eyebrow">Start here</p>
+          <h2 id="formHeading">Create a motion card</h2>
+          <p class="tool-copy">Use a public post URL from X or Twitter.</p>
+          <form id="tweetForm" novalidate>
+            <label for="tweetUrl">Twitter or X post URL</label>
+            <div class="input-group">
+              <input type="url" id="tweetUrl" name="tweetUrl"
+                placeholder="https://x.com/username/status/123456"
+                autocomplete="url" autocorrect="off" autocapitalize="off" spellcheck="false"
+                aria-describedby="urlHint urlError" required>
+              <button type="submit" id="processBtn" class="btn-primary">Create card</button>
+            </div>
+            <p id="urlHint" class="field-hint">Paste a post URL from twitter.com, www.twitter.com, x.com, or www.x.com.</p>
+            <p id="urlError" class="field-error hidden" role="alert"></p>
+          </form>
+        </section>
+      </div>
 
       <section id="loadingSection" class="loading-section hidden" role="status" aria-live="polite" aria-atomic="true">
-        <div class="spinner" aria-hidden="true"></div>
-        <p id="loadingStatus">Starting conversion...</p>
-        <p id="loadingElapsed" class="loading-elapsed" aria-hidden="true"></p>
+        <div class="loading-header">
+          <div>
+            <p class="eyebrow">In progress</p>
+            <p id="loadingStatus">Starting conversion...</p>
+          </div>
+          <p id="loadingElapsed" class="loading-elapsed" aria-hidden="true"></p>
+        </div>
+        <ol id="loadingSteps" class="loading-steps" aria-label="Conversion progress">
+          <li role="listitem" data-progress-step="1" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Fetch post</span></li>
+          <li role="listitem" data-progress-step="2" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Download media</span></li>
+          <li role="listitem" data-progress-step="3" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Render card</span></li>
+          <li role="listitem" data-progress-step="4" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Composite video</span></li>
+          <li role="listitem" data-progress-step="5" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Create GIF</span></li>
+          <li role="listitem" data-progress-step="6" data-state="upcoming"><span class="step-marker" aria-hidden="true"></span><span>Create WebM</span></li>
+        </ol>
+        <p id="loadingNote" class="loading-note">Keep this tab open. Refreshing is safe while the conversion runs.</p>
       </section>
 
       <section id="resultSection" class="result-section hidden" aria-labelledby="resultHeading" tabindex="-1">
-        <h2 id="resultHeading">Your tweet is ready!</h2>
-        <p id="resultSummary" class="result-summary"></p>
-        <p id="cacheNotice" class="cache-notice hidden" role="status" aria-live="polite"></p>
+        <div class="section-heading">
+          <p class="eyebrow">Ready to share</p>
+          <h2 id="resultHeading">Your tweet is ready</h2>
+          <p id="resultSummary" class="result-summary"></p>
+          <p id="cacheNotice" class="cache-notice hidden" role="status" aria-live="polite"></p>
+        </div>
         <div class="preview-container">
           <div class="preview-tabs" role="tablist" aria-label="Preview format">
             <button type="button" id="gifTab" class="tab-btn active" role="tab" data-tab="gif" aria-selected="true" aria-controls="gifPreview" tabindex="0">GIF</button>
@@ -60,18 +104,27 @@
           </div>
         </div>
         <div class="action-buttons" aria-label="Download and share options">
+          <div class="download-action download-action-primary">
+            <button type="button" id="downloadVideoBtn" class="btn-primary">Download MP4</button>
+            <span id="downloadVideoNote" class="button-note"></span>
+          </div>
           <button type="button" id="downloadGifBtn" class="btn-secondary">Download GIF</button>
-          <button type="button" id="downloadVideoBtn" class="btn-secondary">Download MP4</button>
           <button type="button" id="downloadWebmBtn" class="btn-secondary">Download WebM</button>
           <div class="share-group">
             <label for="shareFormat" class="visually-hidden">Share format</label>
             <select id="shareFormat" class="share-select">
               <option value="gif">GIF</option><option value="video">MP4</option><option value="webm">WebM</option>
             </select>
-            <button type="button" id="copyLinkBtn" class="btn-secondary">Copy Link</button>
+            <button type="button" id="copyLinkBtn" class="btn-tertiary">Copy share link</button>
           </div>
         </div>
-        <div id="shareSection" class="share-section hidden" role="status" aria-live="polite"><p></p></div>
+        <div id="shareSection" class="share-section hidden" role="status" aria-live="polite">
+          <p id="shareMessage"></p>
+          <div id="manualShareField" class="manual-share hidden">
+            <label for="shareUrlInput">Share URL</label>
+            <input id="shareUrlInput" type="text" readonly spellcheck="false">
+          </div>
+        </div>
       </section>
 
       <section id="errorSection" class="error-section hidden" role="alert" aria-atomic="true" tabindex="-1">
@@ -81,7 +134,7 @@
       </section>
     </main>
 
-    <footer><p>Note: Processing may take 30-60 seconds depending on media content.</p></footer>
+    <footer><p>Processing usually takes 30–60 seconds. Generated files are removed after 24 hours.</p></footer>
   </div>
   <script src="script.js"></script>
 </body>

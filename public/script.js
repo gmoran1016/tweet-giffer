@@ -4,6 +4,7 @@ const processBtn = document.getElementById('processBtn');
 const loadingSection = document.getElementById('loadingSection');
 const loadingStatus = document.getElementById('loadingStatus');
 const loadingElapsed = document.getElementById('loadingElapsed');
+const progressSteps = [...document.querySelectorAll('[data-progress-step]')];
 const resultSection = document.getElementById('resultSection');
 const resultHeading = document.getElementById('resultHeading');
 const resultSummary = document.getElementById('resultSummary');
@@ -11,15 +12,20 @@ const cacheNotice = document.getElementById('cacheNotice');
 const errorSection = document.getElementById('errorSection');
 const errorMessage = document.getElementById('errorMessage');
 const retryBtn = document.getElementById('retryBtn');
+const urlError = document.getElementById('urlError');
 const gifImg = document.getElementById('gifImg');
 const videoPlayer = document.getElementById('videoPlayer');
 const webmPlayer = document.getElementById('webmPlayer');
 const downloadGifBtn = document.getElementById('downloadGifBtn');
 const downloadVideoBtn = document.getElementById('downloadVideoBtn');
 const downloadWebmBtn = document.getElementById('downloadWebmBtn');
+const downloadVideoNote = document.getElementById('downloadVideoNote');
 const copyLinkBtn = document.getElementById('copyLinkBtn');
 const shareFormat = document.getElementById('shareFormat');
 const shareSection = document.getElementById('shareSection');
+const shareMessage = document.getElementById('shareMessage');
+const manualShareField = document.getElementById('manualShareField');
+const shareUrlInput = document.getElementById('shareUrlInput');
 const tabButtons = [...document.querySelectorAll('[role="tab"]')];
 const webmTab = document.getElementById('webmTab');
 const webmOption = shareFormat.querySelector('option[value="webm"]');
@@ -50,10 +56,25 @@ function formatElapsed(milliseconds) {
 }
 
 function formatProgress(message, stepIndex, stepCount) {
+  const safeMessage = typeof message === 'string' && message ? message : 'Working...';
   if (Number.isInteger(stepIndex) && stepIndex > 0 && Number.isInteger(stepCount) && stepCount > 0) {
-    return `Step ${stepIndex} of ${stepCount}: ${message}`;
+    return `Step ${stepIndex} of ${stepCount}: ${safeMessage}`;
   }
-  return message || 'Starting conversion...';
+  return safeMessage;
+}
+
+function updateProgressRail(stepIndex, stepCount) {
+  const totalSteps = progressSteps.length;
+  const hasActiveStep = Number.isInteger(stepIndex) && stepIndex > 0;
+  const activeStep = hasActiveStep ? Math.min(stepIndex, totalSteps) : 0;
+  progressSteps.forEach((step, index) => {
+    const stepNumber = index + 1;
+    const state = activeStep && stepNumber < activeStep ? 'complete' :
+      stepNumber === activeStep ? 'active' : 'upcoming';
+    step.dataset.state = state;
+    if (state === 'active') step.setAttribute('aria-current', 'step');
+    else step.removeAttribute('aria-current');
+  });
 }
 
 function readStoredJob() {
@@ -133,6 +154,20 @@ function parseTweetUrl(value) {
   return parsed.href;
 }
 
+function clearFieldError() {
+  urlError.textContent = '';
+  urlError.classList.add('hidden');
+  tweetUrlInput.setAttribute('aria-invalid', 'false');
+  tweetUrlInput.setAttribute('aria-describedby', 'urlHint');
+}
+
+function setFieldError(message) {
+  urlError.textContent = message;
+  urlError.classList.remove('hidden');
+  tweetUrlInput.setAttribute('aria-invalid', 'true');
+  tweetUrlInput.setAttribute('aria-describedby', 'urlHint urlError');
+}
+
 async function readJsonResponse(response, fallbackMessage) {
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.toLowerCase().includes('application/json')) throw new Error(fallbackMessage);
@@ -194,6 +229,7 @@ async function pollForResult(jobId, run, immediate = false) {
       return status.result;
     }
     if (activeRun === run) {
+      updateProgressRail(status.stepIndex, status.stepCount);
       loadingStatus.textContent = formatProgress(status.message, status.stepIndex, status.stepCount);
       if (Number.isFinite(status.elapsedMs) && !elapsedTimer) loadingElapsed.textContent = `Elapsed ${formatElapsed(status.elapsedMs)}.`;
     }
@@ -225,10 +261,11 @@ tweetForm.addEventListener('submit', async (event) => {
   clearMedia();
   currentResult = null;
   hideAllSections();
+  clearFieldError();
 
   let url;
   try { url = parseTweetUrl(tweetUrlInput.value.trim()); }
-  catch (error) { showError(error.message, 'INVALID_URL'); tweetUrlInput.focus(); return; }
+  catch (error) { showError(error.message, 'INVALID_URL'); return; }
 
   tweetUrlInput.value = url;
   lastSubmittedUrl = url;
@@ -276,7 +313,7 @@ tweetForm.addEventListener('submit', async (event) => {
     stopElapsedTimer();
     if (activeRun === run) {
       activeRun = null;
-      processBtn.disabled = false; processBtn.textContent = 'Create GIF/Video'; hideLoading();
+      processBtn.disabled = false; processBtn.textContent = 'Create card'; hideLoading();
     }
   }
 });
@@ -314,12 +351,16 @@ function displayResults(data) {
   currentResult = data;
   const authorLabel = data.authorName ? ` for ${data.authorName}` : '';
   const staticCard = data.staticCard === true;
-  resultHeading.textContent = staticCard ? 'Static tweet card ready' : 'Your tweet is ready!';
+  resultHeading.textContent = staticCard ? 'Static tweet card ready' : 'Your tweet is ready';
   resultSummary.textContent = staticCard
     ? 'This post has no video. Downloads contain a five-second animated card with no audio.'
     : `Video conversion complete${authorLabel}.`;
+  downloadVideoNote.textContent = staticCard ? 'no audio' : 'with audio';
   cacheNotice.textContent = data.cached === true ? 'Loaded from cache.' : '';
   cacheNotice.classList.toggle('hidden', data.cached !== true);
+  shareMessage.textContent = '';
+  manualShareField.classList.add('hidden');
+  shareUrlInput.value = '';
   gifImg.src = data.gif; videoPlayer.src = data.video;
   gifImg.alt = `${staticCard ? 'Animated static tweet card' : 'Animated preview of converted tweet'}${authorLabel}`;
   videoPlayer.setAttribute('aria-label', `${staticCard ? 'MP4 static tweet card' : 'MP4 preview of converted tweet'}${authorLabel}`);
@@ -346,8 +387,14 @@ copyLinkBtn.addEventListener('click', async () => {
   const format = shareFormat.value;
   if (!currentResult[format === 'video' ? 'video' : format]) return;
   const shareUrl = `${window.location.origin}/share/${encodeURIComponent(currentResult.videoId)}?f=${encodeURIComponent(format)}`;
+  shareUrlInput.value = shareUrl;
+  manualShareField.classList.add('hidden');
   let copied = false;
-  try { await navigator.clipboard.writeText(shareUrl); copied = true; }
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('Clipboard unavailable');
+    await navigator.clipboard.writeText(shareUrl);
+    copied = true;
+  }
   catch {
     const textArea = document.createElement('textarea');
     try {
@@ -356,14 +403,18 @@ copyLinkBtn.addEventListener('click', async () => {
     } catch { copied = false; }
     finally { textArea.remove(); }
   }
-  shareSection.querySelector('p').textContent = copied
-    ? `${format.toUpperCase()} link copied to clipboard!`
-    : `Unable to copy automatically. Copy this link manually: ${shareUrl}`;
+  shareMessage.textContent = copied ? `${format.toUpperCase()} share link copied.` : 'Copy this link manually.';
+  manualShareField.classList.toggle('hidden', copied);
   shareSection.classList.remove('hidden'); clearTimeout(shareTimer);
   shareTimer = copied ? setTimeout(() => shareSection.classList.add('hidden'), 3000) : null;
 });
 
-function showLoading(message, progress = {}) {
+function showLoading(message = 'Starting conversion...', progress = {}) {
+  if (message && typeof message === 'object') {
+    progress = message;
+    message = progress.message || 'Starting conversion...';
+  }
+  updateProgressRail(progress.stepIndex, progress.stepCount);
   loadingStatus.textContent = formatProgress(message, progress.stepIndex, progress.stepCount);
   if (Number.isFinite(progress.elapsedMs) && !elapsedTimer) loadingElapsed.textContent = `Elapsed ${formatElapsed(progress.elapsedMs)}.`;
   loadingSection.classList.remove('hidden');
@@ -375,6 +426,14 @@ function hideLoading() {
 }
 
 function showError(message, code = null) {
+  if (code === 'INVALID_URL') {
+    setFieldError(message);
+    errorSection.classList.add('hidden');
+    retryBtn.classList.add('hidden');
+    tweetUrlInput.focus();
+    return;
+  }
+  clearFieldError();
   errorMessage.textContent = message;
   retryBtn.classList.toggle('hidden', !RETRYABLE_ERROR_CODES.has(code));
   errorSection.classList.remove('hidden');
@@ -387,6 +446,7 @@ retryBtn.addEventListener('click', () => {
     return;
   }
   tweetUrlInput.value = lastSubmittedUrl;
+  clearFieldError();
   tweetForm.requestSubmit();
 });
 
@@ -394,6 +454,7 @@ function hideAllSections() {
   loadingSection.classList.add('hidden'); resultSection.classList.add('hidden');
   errorSection.classList.add('hidden'); shareSection.classList.add('hidden');
   cacheNotice.classList.add('hidden'); retryBtn.classList.add('hidden');
+  manualShareField.classList.add('hidden'); shareMessage.textContent = ''; shareUrlInput.value = '';
 }
 
 async function restoreActiveJob() {
@@ -439,7 +500,7 @@ async function restoreActiveJob() {
     if (activeRun === run) {
       activeRun = null;
       processBtn.disabled = false;
-      processBtn.textContent = 'Create GIF/Video';
+      processBtn.textContent = 'Create card';
       hideLoading();
     }
   }

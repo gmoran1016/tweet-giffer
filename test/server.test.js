@@ -216,6 +216,21 @@ test('rejects invalid job and output IDs before lookup', async () => {
   assert.equal((await fetch(`${base}/share/not-a-uuid`)).status, 400);
 });
 
+test('renders branded human and JSON API 404 fallbacks', async () => {
+  const human404 = await fetch(`${base}/route-that-does-not-exist`);
+  const humanBody = await human404.text();
+  assert.equal(human404.status, 404);
+  assert.match(humanBody, /Tweet Giffer/);
+  assert.match(humanBody, /Back to the tool/);
+
+  const api404 = await fetch(`${base}/api/route-that-does-not-exist`, {
+    headers: { Accept: 'application/json' },
+  });
+  assert.equal(api404.status, 404);
+  assert.equal(api404.headers.get('content-type').includes('application/json'), true);
+  assert.deepEqual(await api404.json(), { error: 'Not found', errorCode: 'NOT_FOUND' });
+});
+
 test('escapes share metadata and safely falls back from unsupported formats', async () => {
   const id = '123e4567-e89b-42d3-a456-426614174000';
   await fs.mkdir(process.env.OUTPUT_DIR, { recursive: true });
@@ -291,6 +306,10 @@ test('share emits Discord-friendly canonical video metadata', async () => {
     assert.match(html, new RegExp(`<meta name="twitter:player" content="https://giffer\\.example\\.test/share/${id}\\?f=video" />`));
     assert.match(html, new RegExp(`<meta name="twitter:player:stream" content="https://giffer\\.example\\.test/outputs/${id}\\.mp4" />`));
     assert.match(html, new RegExp(`<link rel="canonical" href="https://giffer\\.example\\.test/share/${id}\\?f=video" />`));
+    assert.match(html, /<main class="public-shell">/);
+    assert.match(html, /Open media file/);
+    assert.match(html, /Back to the tool/);
+    assert.match(html, /View original post/);
     assert.doesNotMatch(html, /<meta property="og:url" content="https:\/\/x\.com/);
   } finally {
     delete process.env.PUBLIC_BASE_URL;

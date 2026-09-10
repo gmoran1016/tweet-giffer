@@ -1463,11 +1463,60 @@ function resolvePublicBase(req) {
   return `${req.protocol === 'https' ? 'https' : 'http'}://${parsedHost.host}`;
 }
 
+const PUBLIC_PAGE_STYLES = `<style>
+:root { color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; color: #1f292d; background: #f2eee6; }
+* { box-sizing: border-box; }
+body { min-height: 100dvh; margin: 0; padding: 24px; display: grid; place-items: center; background: #f2eee6; }
+.public-shell { width: min(760px, 100%); padding: clamp(24px, 5vw, 56px); border-radius: 28px; background: #fffdf8; box-shadow: 0 24px 70px rgba(40, 51, 49, .16), 0 2px 10px rgba(40, 51, 49, .08); text-align: center; }
+.brand-mark { width: 48px; height: 48px; margin-bottom: 18px; border-radius: 16px; outline: 1px solid rgba(18, 108, 116, .2); outline-offset: 4px; }
+.eyebrow { margin: 0 0 10px; color: #126c74; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+h1 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: clamp(32px, 6vw, 56px); line-height: 1; letter-spacing: -.04em; text-wrap: balance; }
+.message { max-width: 48ch; margin: 18px auto 28px; color: #627076; line-height: 1.6; text-wrap: pretty; }
+.media { max-width: 100%; margin: 24px auto; overflow: hidden; border-radius: 20px; box-shadow: 0 1px 2px rgba(31, 41, 45, .08), 0 8px 18px rgba(31, 41, 45, .08); }
+.media img, .media video { display: block; width: 100%; max-width: 100%; height: auto; outline: 1px solid rgba(0, 0, 0, .1); outline-offset: -1px; }
+.actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+.actions a { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; padding: 11px 18px; border-radius: 12px; background: #126c74; color: #fffdf8; font-weight: 700; text-decoration: none; transition: background-color 150ms ease-out, box-shadow 150ms ease-out, transform 150ms ease-out, scale 150ms ease-out; }
+.actions a:hover { background: #0e5057; transform: translateY(-1px); box-shadow: 0 8px 18px rgba(18, 108, 116, .18); }
+.actions a:active { scale: .96; }
+.actions a.secondary { border: 1px solid rgba(18, 108, 116, .28); color: #0e5057; background: #fffdf8; }
+.actions a.secondary:hover { color: #0e5057; background: #e4f1ee; }
+@media (max-width: 560px) { body { padding: 10px; } .public-shell { border-radius: 20px; padding: 24px 18px; } .actions { flex-direction: column; } .actions a { width: 100%; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; } .actions a:hover { transform: none; } }
+</style>`;
+
+function renderPublicPage({ title, eyebrow, message, actionHref = '/', actionLabel = 'Back to the tool', mediaHtml = '', secondaryHtml = '' }) {
+  const safeActionHref = escapeHtml(actionHref);
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2eee6">
+  <title>${escapeHtml(title)}</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  ${PUBLIC_PAGE_STYLES}
+</head><body>
+  <main class="public-shell">
+    <img class="brand-mark" src="/favicon.svg" alt="" width="48" height="48">
+    <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+    <h1>${escapeHtml(title)}</h1>
+    <p class="message">${escapeHtml(message)}</p>
+    ${mediaHtml ? `<div class="media">${mediaHtml}</div>` : ''}
+    <div class="actions"><a href="${safeActionHref}">${escapeHtml(actionLabel)}</a>${secondaryHtml}</div>
+  </main>
+</body></html>`;
+}
+
 // Share embed page — returns OG-tagged HTML so Discord/Slack/etc embed properly with audio
 // Usage: /share/:videoId?f=video  (f = gif | video | webm, defaults to video)
 app.get('/share/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  if (!isUuid(videoId)) return res.status(400).send('Invalid output ID');
+  if (!isUuid(videoId)) {
+    return res.status(400).type('html').send(renderPublicPage({
+      title: 'Invalid share link · Tweet Giffer',
+      eyebrow: 'Share link',
+      message: 'This share link is not valid. The conversion tool is ready when you are.',
+    }));
+  }
   const requestedFormat = typeof req.query.f === 'string' ? req.query.f : 'video';
   const format = new Set(['video', 'gif', 'webm']).has(requestedFormat) ? requestedFormat : 'video';
 
@@ -1476,7 +1525,11 @@ app.get('/share/:videoId', async (req, res) => {
   const webmExists = fsSync.existsSync(path.join(outputDir, `${videoId}.webm`));
 
   if (!mp4Exists && !gifExists && !webmExists) {
-    return res.status(404).send('Not found');
+    return res.status(404).type('html').send(renderPublicPage({
+      title: 'Media not found · Tweet Giffer',
+      eyebrow: 'Share link',
+      message: 'This generated file is no longer available. Create a new card to share it again.',
+    }));
   }
 
   // Load stored metadata (tweet URL + author) if available
@@ -1498,9 +1551,19 @@ app.get('/share/:videoId', async (req, res) => {
   try {
     base = resolvePublicBase(req);
   } catch {
-    return res.status(500).send('Share origin configuration is invalid');
+    return res.status(500).type('html').send(renderPublicPage({
+      title: 'Share unavailable · Tweet Giffer',
+      eyebrow: 'Configuration error',
+      message: 'The share origin configuration is invalid.',
+    }));
   }
-  if (!base) return res.status(503).send('Share origin is not configured');
+  if (!base) {
+    return res.status(503).type('html').send(renderPublicPage({
+      title: 'Share unavailable · Tweet Giffer',
+      eyebrow: 'Share setup',
+      message: 'Share origin is not configured.',
+    }));
+  }
   const mp4Url  = `${base}/outputs/${videoId}.mp4`;
   const gifUrl  = `${base}/outputs/${videoId}.gif`;
   const webmUrl = `${base}/outputs/${videoId}.webm`;
@@ -1538,6 +1601,11 @@ app.get('/share/:videoId', async (req, res) => {
   const safeWidth = escapeHtml(outputWidth);
   const safeHeight = escapeHtml(outputHeight);
   const twitterCard = isVideo ? 'player' : 'summary_large_image';
+  const pageTitle = authorName ? `Tweet by ${authorName}` : 'Tweet Giffer';
+  const mediaHtml = isVideo
+    ? `<video src="${safeFileUrl}" ${safeThumbUrl ? `poster="${safeThumbUrl}" ` : ''}controls playsinline></video>`
+    : `<img src="${safeFileUrl}" alt="${ogTitle}" />`;
+  const secondaryHtml = `<a class="secondary" href="/">Back to the tool</a>${safeTweetUrl ? `<a class="secondary" href="${safeTweetUrl}">View original post</a>` : ''}`;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1545,6 +1613,8 @@ app.get('/share/:videoId', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${ogTitle}</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  ${PUBLIC_PAGE_STYLES}
   <link rel="canonical" href="${safeShareUrl}" />
   <meta property="og:type" content="${isVideo ? 'video.other' : 'website'}" />
   <meta property="og:title" content="${ogTitle}" />
@@ -1572,11 +1642,14 @@ app.get('/share/:videoId', async (req, res) => {
   ` : ''}
 </head>
 <body>
-  ${isVideo
-    ? `<video src="${safeFileUrl}" ${safeThumbUrl ? `poster="${safeThumbUrl}" ` : ''}controls playsinline style="max-width:100%;height:auto"></video>`
-    : `<img src="${safeFileUrl}" alt="${ogTitle}" style="max-width:100%;height:auto" />`}
-  <p><a href="${safeFileUrl}">Open media file</a></p>
-  ${safeTweetUrl ? `<p><a href="${safeTweetUrl}">View original tweet</a></p>` : ''}
+  <main class="public-shell">
+    <img class="brand-mark" src="/favicon.svg" alt="" width="48" height="48">
+    <p class="eyebrow">${staticCard ? 'Tweet card' : 'Motion card'}</p>
+    <h1>${escapeHtml(pageTitle)}</h1>
+    <p class="message">${escapeHtml(staticCard ? 'A shareable tweet card.' : 'A shareable tweet video with audio.')}</p>
+    <div class="media">${mediaHtml}</div>
+    <div class="actions"><a href="${safeFileUrl}">Open media file</a>${secondaryHtml}</div>
+  </main>
 </body>
 </html>`;
 
@@ -1657,6 +1730,17 @@ function runFfmpegArgs(args, options = {}) {
 
 app.get('/api/health', (req, res, next) => sendReadiness(res).catch(next));
 app.get('/api/ready', (req, res, next) => sendReadiness(res).catch(next));
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'Not found', errorCode: 'NOT_FOUND' });
+  }
+  return res.status(404).type('html').send(renderPublicPage({
+    title: 'Page not found · Tweet Giffer',
+    eyebrow: '404',
+    message: 'That page is not available. The conversion tool is ready when you are.',
+  }));
+});
 
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large' });
