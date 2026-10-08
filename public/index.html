@@ -4,7 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Turn public X posts into shareable GIF, MP4, and WebM motion cards.">
-  <meta name="theme-color" content="#f2eee6">
+  <meta name="theme-color" content="#f2eee6" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151c1d" media="(prefers-color-scheme: dark)">
   <meta property="og:title" content="Tweet Giffer">
   <meta property="og:description" content="Turn public posts into shareable motion cards.">
   <meta property="og:image" content="/social-card.svg">
@@ -20,7 +21,6 @@
       <div class="brand-lockup">
         <img class="brand-mark" src="/favicon.svg" alt="" width="48" height="48">
         <div>
-          <p class="eyebrow">Media utility</p>
           <h1>Tweet Giffer</h1>
         </div>
       </div>
@@ -30,7 +30,6 @@
     <main id="mainContent" tabindex="-1">
       <div class="workspace-grid">
         <section class="intro-panel" aria-labelledby="introHeading">
-          <p class="eyebrow">A calmer way to share</p>
           <h2 id="introHeading">Make the moment portable.</h2>
           <p class="intro-copy">Paste a public post and get a polished card you can save, send, or drop into a conversation.</p>
           <ul class="feature-list">
@@ -41,7 +40,6 @@
         </section>
 
         <section class="input-section tool-panel" aria-labelledby="formHeading">
-          <p class="eyebrow">Start here</p>
           <h2 id="formHeading">Create a motion card</h2>
           <p class="tool-copy">Use a public post URL from X or Twitter.</p>
           <form id="tweetForm" novalidate>
@@ -59,12 +57,9 @@
         </section>
       </div>
 
-      <section id="loadingSection" class="loading-section hidden" role="status" aria-live="polite" aria-atomic="true">
+      <section id="loadingSection" class="loading-section hidden">
         <div class="loading-header">
-          <div>
-            <p class="eyebrow">In progress</p>
-            <p id="loadingStatus">Starting conversion...</p>
-          </div>
+          <p id="loadingStatus" role="status" aria-live="polite" aria-atomic="true">Starting conversion...</p>
           <p id="loadingElapsed" class="loading-elapsed" aria-hidden="true"></p>
         </div>
         <ol id="loadingSteps" class="loading-steps" aria-label="Conversion progress">
@@ -80,7 +75,6 @@
 
       <section id="resultSection" class="result-section hidden" aria-labelledby="resultHeading" tabindex="-1">
         <div class="section-heading">
-          <p class="eyebrow">Ready to share</p>
           <h2 id="resultHeading">Your tweet is ready</h2>
           <p id="resultSummary" class="result-summary"></p>
           <p id="cacheNotice" class="cache-notice hidden" role="status" aria-live="polite"></p>

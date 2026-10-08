@@ -63,6 +63,53 @@ test('static-card and cached result states are announced in the real page', { sk
   }
 });
 
+test('theme preference and focused progress announcements work in the rendered page', { skip: !browserEnabled }, async () => {
+  const page = await browser.newPage();
+  const themes = {};
+  try {
+    for (const [layout, width, height] of [['desktop', 1280, 900], ['mobile', 390, 844]]) {
+      await page.setViewport({ width, height });
+      for (const preference of ['light', 'dark']) {
+        await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: preference }]);
+        await page.goto(`${base}/`, { waitUntil: 'networkidle0' });
+        const key = `${preference}-${layout}`;
+        themes[key] = await page.evaluate(() => ({
+          colorScheme: getComputedStyle(document.documentElement).colorScheme,
+          canvas: getComputedStyle(document.body).backgroundColor,
+          ink: getComputedStyle(document.body).color,
+          placeholder: getComputedStyle(document.getElementById('tweetUrl'), '::placeholder').color,
+          overflow: document.documentElement.scrollWidth > window.innerWidth,
+          statusRole: document.getElementById('loadingStatus').getAttribute('role'),
+          statusLive: document.getElementById('loadingStatus').getAttribute('aria-live'),
+          statusAtomic: document.getElementById('loadingStatus').getAttribute('aria-atomic'),
+          sectionRole: document.getElementById('loadingSection').getAttribute('role'),
+          sectionLive: document.getElementById('loadingSection').getAttribute('aria-live'),
+        }));
+        await page.evaluate(() => updateProgressRail(3, 6));
+        assert.deepEqual(await page.$$eval('#loadingSteps [aria-current="step"]', steps => steps.map(step => step.dataset.progressStep)), ['3']);
+      }
+    }
+
+    for (const layout of ['desktop', 'mobile']) {
+      assert.equal(themes[`light-${layout}`].colorScheme, 'light');
+      assert.equal(themes[`dark-${layout}`].colorScheme, 'dark');
+      assert.notEqual(themes[`light-${layout}`].canvas, themes[`dark-${layout}`].canvas);
+      assert.notEqual(themes[`light-${layout}`].ink, themes[`dark-${layout}`].ink);
+      assert.notEqual(themes[`light-${layout}`].placeholder, themes[`dark-${layout}`].placeholder);
+    }
+    for (const theme of Object.values(themes)) {
+      assert.equal(theme.overflow, false);
+      assert.equal(theme.statusRole, 'status');
+      assert.equal(theme.statusLive, 'polite');
+      assert.equal(theme.statusAtomic, 'true');
+      assert.equal(theme.sectionRole, null);
+      assert.equal(theme.sectionLive, null);
+    }
+  } finally {
+    await page.close();
+  }
+});
+
 test('refresh restores a pending job and its stage in the real page', { skip: !browserEnabled }, async () => {
   const page = await browser.newPage();
   const jobId = '923e4567-e89b-42d3-a456-426614174000';

@@ -1,19 +1,19 @@
 # Tweet Giffer
 
-Convert Twitter/X tweet videos into shareable GIFs, MP4s, and WebMs — styled to look exactly like a tweet card, with audio.
+Convert public Twitter/X videos into shareable GIFs, MP4s, and WebMs while keeping the source post's context with the media.
 
-Paste a tweet URL and get back a rendered tweet card with the video composited in, ready to download or share. Share links include Open Graph metadata so they embed properly in Discord with audio.
+Paste a post URL and get a rendered card with the author's identity and post text alongside the video. Download the result or share a link with preview metadata for services such as Discord.
 
 ---
 
 ## Features
 
-- **Three output formats** — GIF, MP4 (with audio), and WebM (VP9/Opus)
-- **Tweet card rendering** — screenshot of the tweet including avatar, author, and text
+- **Three output formats** — GIF, MP4, and WebM (VP9/Opus); audio is retained in video formats when present in the source
+- **Tweet context preserved** — the rendered card includes the post's avatar, author, and text alongside its video
 - **Portrait & landscape video** — auto-detects orientation; portrait videos get a phone-style narrow card
-- **Audio preserved** — downloaded via yt-dlp, composited with FFmpeg
 - **Discord embeds** — share links serve OG meta tags so Discord previews play the video with sound
-- **Self-hostable** — Docker image published to GitHub Container Registry on every push
+- **Light and dark themes** — the interface follows the visitor's system appearance preference
+- **Self-hostable** — Docker image published to GitHub Container Registry on every push to `master`
 
 ---
 
@@ -132,6 +132,23 @@ Key dependencies: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Puppeteer](https:
 `MAX_CONCURRENT_JOBS` is a per-process limit, not a queue: excess work is rejected with HTTP 503 and may be retried later. Conversion is CPU-, memory-, and temporary-disk-intensive; start with the default concurrency and size `/dev/shm` and `/app/temp` for the largest expected videos.
 
 ## Testing
+
+The default test run skips browser-only tests. To run them, install Puppeteer's Chrome first (see Local Development), then enable the browser suite:
+
+PowerShell:
+
+```powershell
+$env:TWEET_GIFFER_BROWSER_TEST = '1'
+npm test
+```
+
+macOS/Linux:
+
+```bash
+TWEET_GIFFER_BROWSER_TEST=1 npm test
+```
+
+The standard checks are:
 
 ```bash
 npm test
